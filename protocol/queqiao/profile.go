@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -74,7 +73,7 @@ func canonicalAddress(address string, limit int) (string, error) {
 }
 
 func loadProfile(path string) (*tls.Config, string, error) {
-	f, err := os.Open(path)
+	f, err := openProfileFile(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("queqiao: open profile: %w", err)
 	}
@@ -175,7 +174,12 @@ func (p clientProfile) tlsConfig(now time.Time) (*tls.Config, error) {
 		// Queqiao uses a pinned provider root and a URI identity, never DNS/WebPKI.
 		// This mandatory callback replaces all default verification; no insecure option exists.
 		InsecureSkipVerify: true,
-		VerifyConnection: func(state tls.ConnectionState) error {
+		VerifyConnection: func(state tls.ConnectionState) (err error) {
+			defer func() {
+				if err != nil {
+					err = identityError{err}
+				}
+			}()
 			if state.Version != tls.VersionTLS13 || state.NegotiatedProtocol != dataALPN {
 				return errors.New("queqiao: TLS version or ALPN mismatch")
 			}

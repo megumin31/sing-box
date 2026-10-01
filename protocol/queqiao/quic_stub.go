@@ -2,14 +2,8 @@
 
 package queqiao
 
-import (
-	"context"
-	"crypto/tls"
-	C "github.com/sagernet/sing-box/constant"
-	"net"
-)
+import C "github.com/sagernet/sing-box/constant"
 
-func checkQUIC() error { return C.ErrQUICNotIncluded }
-func dialQUIC(context.Context, net.Conn, *tls.Config) (net.Conn, error) {
-	return nil, C.ErrQUICNotIncluded
-}
+func checkQUIC() error                      { return C.ErrQUICNotIncluded }
+func newQUICPool(*Outbound) carrierPool     { return nil }
+func initialQUICTerminalFailure(error) bool { return false }

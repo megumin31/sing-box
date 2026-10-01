@@ -14,6 +14,7 @@ const (
 	dataALPN            = "queqiao/1"
 	typeOpen     byte   = 1
 	typeOpenOK   byte   = 2
+	typeJoin     byte   = 3
 	typeData     byte   = 4
 	typeACK      byte   = 5
 	typeClose    byte   = 6
@@ -53,7 +54,7 @@ func validateHeader(b []byte) error {
 		return fmt.Errorf("queqiao: invalid frame header")
 	}
 	flags := binary.BigEndian.Uint16(b[4:6])
-	if flags & ^uint16(191) != 0 || flags&flagReserve != 0 && b[3] != typeOpen && b[3] != 3 || flags&flagRanges != 0 && b[3] != typeACK {
+	if flags & ^uint16(191) != 0 || flags&flagReserve != 0 && b[3] != typeOpen && b[3] != typeJoin || flags&flagRanges != 0 && b[3] != typeACK {
 		return fmt.Errorf("queqiao: invalid frame flags")
 	}
 	if binary.BigEndian.Uint32(b[38:42]) > maxPayload {
@@ -68,7 +69,7 @@ func readFrame(r io.Reader) (frame, error) {
 		return frame{}, err
 	}
 	if err := validateHeader(b[:]); err != nil {
-		return frame{}, err
+		return frame{}, protocolError{err}
 	}
 	f := frame{typ: b[3], flags: binary.BigEndian.Uint16(b[4:6]), flow: binary.BigEndian.Uint64(b[22:30]), sequence: binary.BigEndian.Uint64(b[30:38]), class: b[42]}
 	copy(f.session[:], b[6:22])
@@ -106,7 +107,7 @@ func writeFrame(w io.Writer, f frame) error {
 	return nil
 }
 
-// ACK ranges are understood even though a single reliable lane needs no replay.
+// Selective ranges are validated, but only cumulative ACKs release replay data.
 func validateACK(f frame, sent uint64, final bool) error {
 	if f.flags&flagACKUp == 0 || f.flags & ^uint16(flagACKUp|flagACKFinal|flagRanges) != 0 || f.sequence > sent {
 		return fmt.Errorf("queqiao: invalid upstream ACK")
@@ -134,7 +135,17 @@ func validateACK(f frame, sent uint64, final bool) error {
 func resetError(f frame) error {
 	// Peer-supplied text is intentionally not logged: it may contain private targets.
 	if f.flags != 0 || f.sequence != 0 || len(f.payload) < 1 || len(f.payload) > 257 || f.payload[0] < 1 || f.payload[0] > 5 {
-		return fmt.Errorf("queqiao: malformed RESET")
+		return protocolError{fmt.Errorf("queqiao: malformed RESET")}
 	}
-	return fmt.Errorf("queqiao: gateway reset (code %d)", f.payload[0])
+	return gatewayResetError{code: f.payload[0]}
+}
+
+type protocolError struct{ error }
+
+func (e protocolError) Unwrap() error { return e.error }
+
+type gatewayResetError struct{ code byte }
+
+func (e gatewayResetError) Error() string {
+	return fmt.Sprintf("queqiao: gateway reset (code %d)", e.code)
 }

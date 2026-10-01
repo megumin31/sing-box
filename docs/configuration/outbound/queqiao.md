@@ -1,6 +1,6 @@
 # Queqiao
 
-Experimental native Queqiao protocol-1 outbound for TCP and basic UDP proxying.
+Experimental native Queqiao protocol-1 outbound for TCP and UDP proxying.
 
 ```json
 {
@@ -8,6 +8,12 @@ Experimental native Queqiao protocol-1 outbound for TCP and basic UDP proxying.
   "tag": "queqiao-out",
   "profile_path": "/etc/sing-box/queqiao-profile.json",
   "transport": "tcp",
+  "quic_initial_fallback": false,
+  "quic_path_probe": false,
+  "quic_data_isolation": false,
+  "tcp_recovery": false,
+  "tcp_lanes": 1,
+  "udp_resume": false,
   "network": ["tcp", "udp"]
 }
 ```
@@ -36,12 +42,238 @@ outbound to load the new profile.
 The reliable carrier: `tcp` (default, TLS over TCP) or `quic` (a bidirectional
 QUIC stream). `quic` requires a build with the `with_quic` tag. A build without
 that tag rejects the configuration explicitly; it does not fall back to TCP.
-There is no automatic transport fallback in this implementation.
+Only the explicit option below permits bounded fallback during initial connection setup.
 
 QUIC is deliberately **reliable-stream only**: DATAGRAM and 0-RTT are disabled.
 Advertising DATAGRAM would permit the gateway to send coded TCP DATA, which this
-implementation does not support. Each TCP flow or UDP association owns its own
-QUIC connection and socket; there is currently no pooling or multiplexed reuse.
+implementation does not support. TCP flows and UDP associations share an
+outbound-local pool of at most 4 authenticated QUIC connections, with at most
+64 reserved/open/draining streams per connection. There is no sharing across
+outbounds or profiles. Closing or canceling one stream does not close its peers.
+Idle connections expire after 30 seconds; interface changes discard the pool.
+A shared handshake preserves the initiating flow's common-dialer context values,
+but one canceled waiter cannot cancel other waiting flows.
+
+### quic_initial_fallback
+
+Optional, **false by default**. Requires `"transport": "quic"` and a `with_quic`
+build. It applies only before the first OPEN is sent; it does not migrate an
+established TCP flow or UDP association.
+
+When enabled, the initial QUIC attempt has a 5-second limit. An allowed network
+failure, such as timeout, connection refusal/reset or an unreachable route, permits
+one TLS/TCP attempt to the same profile endpoint. Identity, certificate, protocol,
+pool-capacity, stream-admission (including stream-credit timeout), permission and
+cancellation errors do not trigger fallback.
+After QUIC returns a stream, an OPEN write error, missing response or gateway
+refusal cannot trigger fallback and accidentally create a second destination
+connection. Unclassified failures remain errors.
+
+QUIC, TCP, TLS authentication and OPEN share the existing 15-second total budget;
+a shorter caller deadline takes precedence. There is no parallel race, persistent
+preference or shared TCP cooldown: each new flow still tries QUIC first. TLS/TCP
+uses the same profile's TLS 1.3, mutual authentication, root pin, gateway URI and
+ALPN verification. If `tcp_recovery` or `udp_resume` is enabled, subsequent recovery
+for that flow retains the transport actually selected at initial setup.
+
+This new option has passed offline selection, error-classification, budget and
+cleanup tests, plus TLS 1.3 mutual authentication, one OPEN and data echo over an
+in-memory `net.Pipe` carrier. Localhost tests additionally exercise real QUIC
+handshake timeout followed by TCP mutual authentication on the same endpoint,
+automatic TCP JOIN/replay and UDP resume after a socket interruption, and QUIC
+certificate/ALPN refusals without fallback. These use test protocol peers, not the
+official gateway. Separate opt-in localhost tests against the unmodified official
+gateway also cover five callers sharing a pending QUIC handshake, cancellation
+of one waiter, authenticated TCP fallback for the others, automatic TCP JOIN
+without reopening the destination, and UDP resume preserving the source endpoint
+observed by a real UDP target. However, strict single-send probes reproducibly
+lost the first reply immediately after UDP resume, although the target received
+and replied to that datagram; later probes succeeded. This remains an unresolved
+handover issue, so official UDP fallback/resume acceptance is incomplete. It does
+not establish lossless or exactly-once UDP delivery. Full service operation,
+wider recovery stress and WAN qualification remain unverified.
+
+### quic_path_probe
+
+Optional, **false by default**, requires `transport: "quic"` and a `with_quic`
+build. Before a new authenticated pool connection admits application streams,
+one dedicated reliable stream sends four 1,200-byte protocol-1 PROBE frames.
+Concurrent callers share this preflight. The probe has a three-second budget
+within the existing connection/caller budgets, and half-closes its request.
+Every available echo header and payload byte is checked against the request.
+
+This is an optional echo-conformance diagnostic, not a requirement for base
+TCP/UDP operation, a throughput benchmark or directional capacity/loss estimate.
+The implementation enforces the protocol limits of 128 frames, 1,200 bytes per
+frame and 131,072 payload bytes per probe stream; normal preflight uses only
+4,800 payload bytes. It does not negotiate DATAGRAM or change congestion control.
+
+Debug logs distinguish `conformant`, `incomplete`, cancellation and transport
+failure. If the read budget expires before all echoes arrive, the probe stream is retired and a
+still-live connection may remain in the pool; no negative conclusion is drawn
+about the peer. A known mismatching echo or premature stream EOF is a protocol
+violation: it is logged distinctly, closes that connection and prevents reuse.
+Canceling one caller leaves other reservations alive; canceling the last caller
+or updating the interface retires the old connection and probe. After all expected
+echoes match, trailing bytes observed before EOF or the same deadline are rejected;
+a delayed response EOF alone leaves the completed echo exchange conformant.
+
+A probe-stage timeout or error never triggers initial TCP fallback. With
+`quic_initial_fallback` enabled, failures before QUIC authentication may still
+fall back as described above. Once authentication reaches the probe, a shorter
+caller or five-second initial-attempt deadline can fail that caller without
+switching transport. Subsequent fresh connections run their own preflight;
+there is no periodic background probe or persistent peer ban.
+
+### quic_data_isolation
+
+Optional, **false by default**. Requires explicit `"transport": "quic"`, a
+`with_quic` build and `"tcp_recovery": true`. It applies only to logical TCP
+flows; UDP associations keep their existing reliable pooled stream behavior.
+
+The initial QUIC OPEN reserves its pooled stream as control with RESERVE_CONTROL.
+One additional, separately authenticated QUIC connection joins the same flow as
+the isolated data lane. The client sends DATA on that one designated connection;
+a busy data writer does not make DATA alternate onto a second connection. ACK,
+FIN and other control prefer the control lane. Both lanes may receive legitimate
+DATA/control frames. The official gateway chooses downstream isolation according
+to bulk classification and pooled contention, so this is not per-byte bidirectional
+isolation or a throughput promise. Short flows may stay on its control connection.
+
+Initial OPEN has its existing 15-second limit; isolated JOIN adds at most five
+seconds, and a shorter caller deadline bounds both. A known transient network or
+capacity failure can leave a valid control-only flow. Authentication, protocol,
+PROBE and stream-admission refusals remain errors. There is no automatic retry to
+fill a data lane. With `quic_path_probe`, each new shared or exclusive connection
+uses the existing authenticated preflight before application admission.
+
+Shared, exclusive, connecting, draining and retiring QUIC connections share a
+hard four-connection outbound budget. Exclusive entries are never reused by
+another flow and are released after that flow's stream closes/drains. Shared
+entries retain the normal 64-stream and 30-second idle limits. Isolation consumes
+capacity otherwise available to shared flows, so new admissions can hit the
+outbound limit sooner. A canceled connection retains its quota until its socket
+owner finishes cleanup; quota is not reserved during recovery backoff.
+
+If the data lane fails, it is retired before DATA/replay moves to control, with
+no background data-lane refill. If control fails, the data lane temporarily carries
+control while a same-principal JOIN with RESERVE_CONTROL restores that role.
+All-lane loss restores control first. Role replacements share the existing
+three-attempt/40-second recovery budget; transient exhaustion may leave a surviving
+data-only lane, but cannot hide authorization/protocol refusal. Late JOIN results
+cannot revive a closed flow. A JOIN transport EOF is an admission failure, not
+an application FIN. Normal completion drains both final-frame streams within
+the existing bounds before releasing their resources; cancellation aborts promptly.
+
+`quic_initial_fallback` still acts only before OPEN. If it selects authenticated
+TLS/TCP, this flow uses the ordinary single TLS lane with no reserved QUIC role.
+An isolated JOIN failure after OPEN never selects TCP. DATAGRAM and 0-RTT remain off.
+
+### tcp_lanes
+
+Optional, defaults to **1** (omitted or `0` also means 1). The only additional
+supported value is `2`, which requires explicit `"transport": "tcp"` and
+`"tcp_recovery": true`. It applies to TCP logical flows; UDP associations still
+use one carrier. It cannot combine QUIC and TCP lanes or enable QUIC control-lane
+reservation.
+
+With `2`, the outbound authenticates one OPEN lane and one JOIN lane before
+returning the connection. JOIN preserves the same profile, principal and logical
+session/flow, and must receive OPEN_OK before carrying data. Initial OPEN keeps its 15-second budget, followed by at most five seconds for
+second-lane admission (up to 20 seconds in total); a shorter caller deadline
+bounds both operations. Refusal fails setup
+rather than silently using an incomplete bundle. No second destination is OPENed.
+
+Application chunks alternate between available lanes. ACK/control writes may use
+another free lane while a DATA write is blocked. This is optional reliable lane
+scheduling, not bandwidth measurement, an adaptive scheduler or a throughput
+promise. The same logical receive/replay limits apply to both lanes together;
+matching retransmissions are deduplicated, and conflicting bytes still retained
+in the receive buffer are rejected. Already consumed bytes are not retained for
+comparison.
+
+A failed lane is retired and unacknowledged offsets/FIN state are replayed on a
+survivor. The bundle may remain at one lane; there is no background refill. If all
+lanes fail, the existing bounded TCP recovery budget admits a replacement JOIN.
+At most two live/pending physical lane positions belong to a flow. Closing the
+flow or changing interfaces closes all its carriers. Premature EOF without the
+required logical final state remains an error.
+
+### tcp_recovery
+
+Optional, **false by default**. When enabled, an established TCP flow may recover
+from a failed reliable lane using JOIN on the same transport, profile and logical
+session/flow. It never silently OPENs another destination or falls back to a
+second transport. UDP associations use the separate `udp_resume` option.
+
+Recovery retains at most 1 MiB / 1024 segments of unacknowledged upstream payload.
+Only cumulative ACKs release that replay buffer; selective ranges are validated.
+Downstream offsets deduplicate replay before delivery to the application. With
+recovery enabled, CloseWrite waits for all previous bytes to be cumulatively
+acknowledged before announcing FIN, so replay cannot cross a completed half-close.
+
+A logical flow has at most **3 JOIN attempts across its lifetime**. Each outage
+has a **40-second maximum recovery budget**, each authenticated JOIN has a
+5-second limit, and retries back off. A last capacity-rejection retry waits
+15 seconds to respect the official gateway's young-lane protection window;
+ordinary retries wait 100/200 ms. Explicit identity-validation errors, protocol
+errors and permanent JOIN refusals terminate recovery immediately. An opaque
+handshake/I/O failure still uses only the bounded retry policy; there is no
+indefinite retry loop.
+
+Read/write deadlines remain usable during an outage and can be cleared. A Write
+may report accepted replay-buffer bytes together with a timeout: retry only the
+unaccepted suffix, as indicated by its returned byte count. Close and outbound
+shutdown cancel recovery. Network-interface updates deliberately terminate old
+flows, preserving the existing lifecycle behavior instead of secretly resuming
+across a routing change.
+
+A timeout while waiting to start a physical write does not accept new bytes or
+announce FIN. Clear or extend the deadline and retry the unaccepted bytes or
+CloseWrite. Once a physical write starts, an I/O error can leave delivery
+uncertain; accepted replay bytes and FIN are then owned by the recovery path.
+
+### udp_resume
+
+Optional, **false by default**. Uses the protocol's `WOUD` version-2 association
+and single-use resume token. After a reliable carrier fails, the replacement
+OPEN authenticates the same device and asks the gateway to reclaim the original
+UDP relay socket. New session/flow IDs, a new token, and new packet-number
+windows are used for each successful replacement. The same transport and
+outbound-local QUIC pool are used; no second logical flow slot is allocated.
+
+Resuming the relay preserves the source endpoint observed by remote destinations,
+including associations sending to multiple targets. If the gateway reports a
+fresh relay instead of reclaiming the original, this PacketConn **fails** with
+an error instead of silently changing that source endpoint. Unknown, expired,
+spent, or wrong-principal tokens can all cause that refusal. A lost OPEN_OK can
+consume a token without delivering its successor, so continuity is best effort.
+The official gateway offers a 30-second reclaim window, with its own capacity
+bound and periodic expiry cleanup; clean dissociation does not retain a relay.
+
+**No outgoing datagram is replayed.** When WriteTo discovers a carrier failure,
+it waits for recovery; successful reclaim consumes that one ambiguous datagram
+and returns its length with no error. The datagram may have arrived or been lost.
+This lets sing-box's packet-copy loop continue without a duplicate replay. If
+recovery fails or a deadline/Close interrupts the wait, WriteTo returns zero and
+an error; that packet may still have been delivered. An application retry may
+duplicate it. A successful WriteTo is not an end-to-end delivery acknowledgement.
+Packets in flight
+or during relay handover may be lost. The 64-number receive window suppresses
+repeated sequence numbers within one association; it is reset on resume and
+cannot deduplicate application messages across generations. Previously queued
+received packets remain readable. There is no reliable or exactly-once
+application delivery guarantee.
+
+At most **3 recovery attempts over a PacketConn's lifetime**, each with a
+5-second authenticated OPEN limit, fit within a **20-second outage budget**.
+Attempts wait 100/200/400 ms respectively before dialing. Protocol violations,
+explicit identity-validation errors, and permanent refusals terminate recovery.
+Read/write deadlines remain effective; writes wait for a replacement but retain
+at most one copied packet. Close, outbound shutdown and interface updates cancel
+recovery. A failed or canceled close may leave only the gateway's bounded
+retention entry until expiry. Tokens stay in memory and are neither logged nor
+persisted.
 
 ### network
 
@@ -63,7 +295,8 @@ TCP supports OPEN confirmation, terminal RESET errors, logical byte offsets,
 bounded overlap/reorder handling, cumulative/selective ACK parsing, FIN/final ACK,
 independent half-close, read/write deadlines and canceled opening attempts.
 
-UDP uses the basic `WOUD` version-1 association. Each PACKET carries one datagram
+By default, UDP uses the basic `WOUD` version-1 association. With `udp_resume`,
+it uses version 2. Each PACKET carries one datagram
 (up to 65,507 bytes), its own destination and an independent packet number.
 Destinations may be IPv4, IPv6 or domains; replies must name a numeric source.
 A 64-packet bitmap accepts reordering once and drops duplicates or old packets.
@@ -86,16 +319,46 @@ is not an end-to-end reliable message service.
 - Opening: DNS/socket, TLS/QUIC and OPEN share 15 seconds or a shorter caller deadline
 - Control writes: 15 seconds; TCP Close attempts ABORT for at most 100 ms and UDP
   Close waits at most 500 ms for its final ACK before canceling the carrier
-- QUIC teardown additionally drains queued stream bytes for at most 2 seconds.
-  An in-memory transport-ACK tracker prevents immediate connection close from
-  discarding the last protocol ACK. It retains no payloads or logs, and bounds
-  outstanding packet-span records and acknowledged intervals to 4096 each
+- QUIC stream teardown additionally drains queued bytes for at most 2 seconds.
+  An in-memory transport-ACK tracker attributes byte ranges to their actual stream
+  IDs, including packets containing several streams. It retains no payloads or
+  logs; each connection allows at most 4096 outstanding packet records, 65536
+  packet-span records and 65536 acknowledged intervals. Exceeding the metadata
+  budget fails that drain; it cannot create unbounded retained history
+- QUIC connection receive windows are capped at 16 MiB. The existing per-flow
+  application limits remain in force. A connection is closed no later than the
+  earliest device/gateway certificate-chain expiry, including issuer/root expiry
 
-Carrier loss fails the flow or association; it never silently reconnects or
-replays. Network-interface changes close existing activity. A basic UDP
-association is not retained for resume. A failed TCP ABORT may leave the gateway's
+With `tcp_recovery` disabled, carrier loss fails a TCP flow. With it enabled,
+only the bounded JOIN/replay behavior above is used. Carrier loss fails a
+basic UDP association; `udp_resume` enables the bounded relay-reclaim behavior
+above. Network-interface changes close existing activity. A failed TCP ABORT may leave the gateway's
 normal recovery metadata until its own timeout.
 
-FEC/coded DATAGRAM, JOIN/resume, automatic fallback, connection pools, extra lanes,
-enrollment and automatic renewal are not implemented. No claim is made to
+This version includes an offline FEC codec and fragment reassembly module verified
+with conformance vectors, budget tests and fuzzing. It is not connected to the
+network send/receive paths. The outbound does not negotiate DATAGRAM; the offline
+module does not provide live FEC/coded DATAGRAM support. Active-flow transport migration, extra
+lanes, enrollment and automatic renewal remain unimplemented. No claim is made to
 reproduce Queqiao's full protocol surface or WAN performance optimizations.
+
+## Verification status and known limitations
+
+As of 2026-09-30, the independently reviewed fixes checkpoint passed Queqiao
+package race tests with default and `with_quic` builds, official-gateway loopback
+interoperability using temporary local identities, and CLI builds in both
+configurations. These results do not establish that all sing-box project tests
+pass, production readiness, or WAN performance.
+
+One earlier TCP large full-duplex and half-close interoperability test returned
+`unexpected EOF`; that failure remains unresolved. A separate controlled test
+reproduced an official-gateway race that can close a lane before physically sending
+FIN, but it has not established the cause of that historical EOF. Later passing
+tests do not remove this open risk, and enabling recovery must not be treated as
+a fix for it.
+
+The current test environment's netlink/netns permission restrictions blocked full
+SOCKS service validation. TUN and actual system routing have not been qualified.
+Project-wide checks also have external-network `tlsfragment` test constraints and
+experimental `libbox`/`boxdd` linking limitations with Go 1.25.13. The package-level
+results above do not replace those checks.

@@ -67,7 +67,17 @@ func testOfficialGateway(t *testing.T, transport string) {
 		t.Fatal(err)
 	}
 	defer gatewayLog.Close()
-	gateway := exec.Command(binary, "server", "--state", state, "--listen", endpoint, "--transport", "auto", "--allow-private-destinations", "--log-file", "none", "--log-level", "error")
+	level := "error"
+	if os.Getenv("QUEQIAO_TEST_GATEWAY_DEBUG") == "1" {
+		level = "debug"
+		t.Cleanup(func() {
+			if t.Failed() {
+				data, _ := os.ReadFile(filepath.Join(dir, "gateway.log"))
+				t.Logf("local test gateway log:\n%s", data)
+			}
+		})
+	}
+	gateway := exec.Command(binary, "server", "--state", state, "--listen", endpoint, "--transport", "auto", "--allow-private-destinations", "--log-file", "none", "--log-level", level)
 	gateway.Stdout, gateway.Stderr = gatewayLog, gatewayLog
 	if err = gateway.Start(); err != nil {
 		t.Fatal(err)
@@ -135,7 +145,7 @@ func testOfficialGateway(t *testing.T, transport string) {
 		config := map[string]any{
 			"log":       map[string]any{"level": "error"},
 			"inbounds":  []any{map[string]any{"type": "socks", "listen": "127.0.0.1", "listen_port": proxyPort}},
-			"outbounds": []any{map[string]any{"type": "queqiao", "tag": "native", "profile_path": profile, "transport": transport}},
+			"outbounds": []any{map[string]any{"type": "queqiao", "tag": "native", "profile_path": profile, "transport": transport, "tcp_recovery": true, "udp_resume": true}},
 		}
 		raw, _ := json.Marshal(config)
 		configPath := filepath.Join(dir, "sing-box.json")
@@ -215,6 +225,10 @@ func testOfficialGateway(t *testing.T, transport string) {
 		}()
 		got, err := io.ReadAll(conn)
 		if err != nil {
+			c := conn.(*Conn)
+			c.mu.Lock()
+			t.Logf("TCP failure state: delivered=%d send=%d acked=%d recv=%d localFIN=%v localACK=%v remoteFIN=%v remoteFinal=%d remoteACKSent=%v aborted=%v cause=%v", len(got), c.sendNext, c.acked, c.recvNext, c.localFIN, c.localFinalACK, c.remoteFIN, c.remoteFinal, c.remoteFinalACKSent, c.remoteAbort, c.err)
+			c.mu.Unlock()
 			t.Fatal(err)
 		}
 		if !bytes.Equal(got, payload) {
@@ -286,6 +300,16 @@ func testOfficialGateway(t *testing.T, transport string) {
 		}
 	})
 	testOfficialUDP(t, o)
+	t.Run("UDP-resume-enabled-basic", func(t *testing.T) { testOfficialUDP(t, resumeTestOutbound(t, profile, transport)) })
+	t.Run("UDP-resume", func(t *testing.T) { testOfficialUDPResume(t, profile, transport) })
+	t.Run("UDP-resume-packet-window", func(t *testing.T) { testOfficialUDPResumePacketWindow(t, profile, transport) })
+	t.Run("UDP-resume-write-fault", func(t *testing.T) { testOfficialUDPResumeWriteFault(t, profile, transport) })
+	t.Run("UDP-resume-expired-token", func(t *testing.T) { testOfficialUDPResumeExpiredToken(t, profile, transport) })
+	t.Run("UDP-resume-interface-update", func(t *testing.T) { testOfficialUDPResumeInterfaceUpdate(t, profile, transport) })
+	t.Run("UDP-resume-lost-grant", func(t *testing.T) { testOfficialUDPResumeLostGrant(t, profile, transport) })
+	if transport == "quic" {
+		t.Run("shared-pool-lifecycle", func(t *testing.T) { testOfficialQUICPool(t, profile, destination) })
+	}
 	t.Run("close-cleans-active-flows", func(t *testing.T) {
 		other := newOutbound()
 		c, err := other.DialContext(context.Background(), "tcp", destination)
@@ -297,6 +321,21 @@ func testOfficialGateway(t *testing.T, transport string) {
 			t.Fatal("outbound close did not close flow")
 		}
 	})
+	t.Run("TCP-send-admission-deadline", func(t *testing.T) { testOfficialSendAdmissionDeadline(t, profile, transport) })
+	t.Run("TCP-JOIN-replay", func(t *testing.T) { testOfficialTCPRecovery(t, profile, transport) })
+	t.Run("TCP-JOIN-ACK-loss", func(t *testing.T) { testOfficialRecoveryACKLoss(t, profile, transport) })
+	t.Run("TCP-half-closed-recovery", func(t *testing.T) { testOfficialHalfClosedRecovery(t, profile, transport) })
+	if transport == "quic" {
+		t.Run("shared-connection-TCP-recovery", func(t *testing.T) { testOfficialSharedTCPRecovery(t, profile) })
+		t.Run("shared-connection-UDP-resume", func(t *testing.T) { testOfficialSharedUDPResume(t, profile) })
+	}
+	t.Run("JOIN-principal-isolation", func(t *testing.T) {
+		otherProfile := filepath.Join(dir, "other-device-profile.json")
+		anotherInvite := run("provider", "invite", "--state", state, "--user", "test")
+		run("enroll", "--invite", anotherInvite, "--profile", otherProfile, "--device-name", "other-native-test", "--local-address", "127.0.0.1")
+		testOfficialJoinPrincipal(t, profile, otherProfile, transport, destination)
+		testOfficialUDPResumePrincipal(t, profile, otherProfile, transport)
+	})
 	t.Run("revoked-device-rejected", func(t *testing.T) {
 		raw, err := os.ReadFile(profile)
 		if err != nil {
@@ -306,6 +345,32 @@ func testOfficialGateway(t *testing.T, transport string) {
 		if err = json.Unmarshal(raw, &p); err != nil {
 			t.Fatal(err)
 		}
+		liveTCP, err := o.DialContext(context.Background(), "tcp", destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer liveTCP.Close()
+		liveUDP, err := o.ListenPacket(context.Background(), destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer liveUDP.Close()
+		recoverableAdapter, err := NewOutbound(context.Background(), nil, nil, "revoke-recovery", option.QueqiaoOutboundOptions{ProfilePath: profile, Transport: transport, TCPRecovery: true, UDPResume: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recoverableOutbound := recoverableAdapter.(*Outbound)
+		defer recoverableOutbound.Close()
+		recoverableTCP, err := recoverableOutbound.DialContext(context.Background(), "tcp", destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer recoverableTCP.Close()
+		recoverableUDP, err := recoverableOutbound.ListenPacket(context.Background(), destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer recoverableUDP.Close()
 		run("provider", "revoke-device", "--state", state, "--device", p.DeviceID)
 		// The official gateway refreshes CLI authorization changes once a second.
 		deadline := time.Now().Add(3 * time.Second)
@@ -319,6 +384,29 @@ func testOfficialGateway(t *testing.T, transport string) {
 				t.Fatal("revoked identity still accepted after refresh window")
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+		liveTCP.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, err = liveTCP.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("revoked live TCP was not closed: %v", err)
+		}
+		recoverableTCP.SetReadDeadline(time.Now().Add(4 * time.Second))
+		if _, err = recoverableTCP.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("revoked recovering TCP was not closed: %v", err)
+		}
+		recovered := recoverableTCP.(*Conn)
+		recovered.mu.Lock()
+		attempts := recovered.recoveryAttempts
+		recovered.mu.Unlock()
+		if attempts > maxRecoveryAttempts {
+			t.Fatal("revocation exceeded retry bound")
+		}
+		recoverableUDP.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, _, err = recoverableUDP.ReadFrom(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("revoked resumable UDP was not closed: %v", err)
+		}
+		liveUDP.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if _, _, err = liveUDP.ReadFrom(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("revoked live UDP was not closed: %v", err)
 		}
 	})
 }

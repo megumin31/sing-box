@@ -2,6 +2,7 @@ package queqiao
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -25,10 +26,20 @@ type segment struct {
 	data   []byte
 }
 
-// Conn is one flow on one TLS/TCP lane. Memory is bounded independently of
-// peer claims. There is no replay or reconnect: losing the carrier fails the flow.
+// Conn is one flow on one reliable TLS/TCP or QUIC stream. Memory is bounded
+// independently of peer claims. Optional recovery retains bounded upstream bytes
+// and replaces only the reliable lane, preserving the logical offsets and FIN state.
 type Conn struct {
-	net.Conn
+	carrier                                   net.Conn
+	bundle                                    *tcpBundle
+	localAddr, remoteAddr                     net.Addr
+	join                                      joinLaneFunc
+	recoveryCtx                               context.Context
+	recoveryCancel                            context.CancelFunc
+	recovering, recoveryRunning               bool
+	recoveryAttempts                          int
+	onJoinedLane, joinedFinalACK, joinedFIN   bool
+	replay                                    []segment
 	session                                   [16]byte
 	flow                                      uint64
 	mu                                        sync.Mutex
@@ -55,18 +66,28 @@ type Conn struct {
 }
 
 func newConnState(raw net.Conn, session [16]byte, flow uint64, onClose func()) *Conn {
-	c := &Conn{Conn: raw, session: session, flow: flow, changed: make(chan struct{}), done: make(chan struct{}), writeGate: make(chan struct{}, 1), applicationGate: make(chan struct{}, 1), onClose: onClose, ackReady: make(chan struct{}, 1)}
+	c := &Conn{carrier: raw, localAddr: raw.LocalAddr(), remoteAddr: raw.RemoteAddr(), session: session, flow: flow, changed: make(chan struct{}), done: make(chan struct{}), writeGate: make(chan struct{}, 1), applicationGate: make(chan struct{}, 1), onClose: onClose, ackReady: make(chan struct{}, 1)}
 	c.writeGate <- struct{}{}
 	c.applicationGate <- struct{}{}
 	return c
 }
 
 func newConn(raw net.Conn, session [16]byte, flow uint64, onClose func()) *Conn {
+	return newRecoverableConn(raw, session, flow, onClose, nil, nil)
+}
+func newRecoverableConn(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, join joinLaneFunc) *Conn {
 	c := newConnState(raw, session, flow, onClose)
+	c.join = join
+	if join != nil {
+		c.recoveryCtx, c.recoveryCancel = context.WithCancel(ctx)
+	}
 	go c.ackLoop()
 	go c.readLoop()
 	return c
 }
+func (c *Conn) LocalAddr() net.Addr      { return c.localAddr }
+func (c *Conn) RemoteAddr() net.Addr     { return c.remoteAddr }
+func (c *Conn) currentCarrier() net.Conn { c.mu.Lock(); defer c.mu.Unlock(); return c.carrier }
 
 func closeCarrier(conn net.Conn) {
 	if conn == nil {
@@ -88,6 +109,12 @@ func (c *Conn) terminate(err error) {
 	}
 	c.closed = true
 	c.err = err
+	raw := c.carrier
+	c.carrier = nil
+	c.replay = nil
+	if c.recoveryCancel != nil {
+		c.recoveryCancel()
+	}
 	c.pending = nil
 	c.buffered = c.queue.Len()
 	close(c.done)
@@ -96,7 +123,14 @@ func (c *Conn) terminate(err error) {
 	// TLS Close may wait up to five seconds to write close_notify. Protocol
 	// FIN/ACK_FINAL supplies the authenticated completion signal, so terminate
 	// the underlying carrier directly and promptly unblock both I/O workers.
-	closeCarrier(c.Conn)
+	if c.bundle != nil && c.bundle.roles != nil {
+		c.bundle.roles.shutdown(err)
+	} else {
+		closeCarrier(raw)
+		if c.bundle != nil {
+			c.bundle.shutdown()
+		}
+	}
 	if c.onClose != nil {
 		c.onClose()
 	}
@@ -170,32 +204,69 @@ func (c *Conn) acquire(gate chan struct{}, application bool) error {
 }
 
 func (c *Conn) send(f frame, application bool) error {
-	if err := c.acquire(c.writeGate, application); err != nil {
-		return err
+	return c.sendWithCommit(f, application, nil)
+}
+
+// commit runs once under mu, with the physical write gate held and a ready
+// carrier. Before this point a deadline must not consume offsets or FIN state.
+// After it, any write failure invalidates the carrier and recovery owns replay.
+func (c *Conn) sendWithCommit(f frame, application bool, commit func()) error {
+	if c.bundle != nil {
+		return c.bundle.send(f, application, commit, false)
 	}
-	defer func() { c.writeGate <- struct{}{} }()
-	c.mu.Lock()
-	if c.closed {
+	controlDeadline := time.Now().Add(controlTimeout)
+	for {
+		if err := c.waitReady(application, time.Time{}); err != nil {
+			return err
+		}
+		if !application {
+			controlDeadline = time.Now().Add(controlTimeout)
+		}
+		if err := c.acquire(c.writeGate, application); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			return net.ErrClosed
+		}
+		if c.recovering || c.carrier == nil {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			continue
+		}
+		raw := c.carrier
+		d := controlDeadline
+		if application {
+			d = c.writeDeadline
+		}
+		if application && !d.IsZero() && !time.Now().Before(d) {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			return os.ErrDeadlineExceeded
+		}
+		if commit != nil {
+			commit()
+			commit = nil
+		}
+		c.writingApplication = application
+		raw.SetWriteDeadline(d)
 		c.mu.Unlock()
-		return net.ErrClosed
+		f.session, f.flow = c.session, c.flow
+		err := writeFrame(raw, f)
+		c.mu.Lock()
+		c.writingApplication = false
+		raw.SetWriteDeadline(time.Time{})
+		c.mu.Unlock()
+		c.writeGate <- struct{}{}
+		if err == nil {
+			return nil
+		}
+		if !c.failCarrier(raw, err) {
+			return err
+		}
 	}
-	d := time.Now().Add(controlTimeout)
-	if application {
-		d = c.writeDeadline
-	}
-	c.writingApplication = application
-	c.Conn.SetWriteDeadline(d)
-	c.mu.Unlock()
-	f.session, f.flow = c.session, c.flow
-	err := writeFrame(c.Conn, f)
-	c.mu.Lock()
-	c.writingApplication = false
-	c.Conn.SetWriteDeadline(time.Time{})
-	c.mu.Unlock()
-	if err != nil {
-		c.terminate(err)
-	}
-	return err
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
@@ -252,12 +323,20 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return written, err
 		}
 		d := c.writeDeadline
+		if c.recovering {
+			changed := c.changed
+			c.mu.Unlock()
+			if err := waitChange(changed, c.done, d); err != nil {
+				return written, err
+			}
+			continue
+		}
 		if !d.IsZero() && !time.Now().Before(d) {
 			c.mu.Unlock()
 			return written, os.ErrDeadlineExceeded
 		}
 		n := min(len(p), chunkSize)
-		if c.sendNext-c.acked+uint64(n) > sendWindow {
+		if c.sendNext-c.acked+uint64(n) > sendWindow || c.join != nil && len(c.replay) >= 1024 {
 			changed := c.changed
 			c.mu.Unlock()
 			if err := waitChange(changed, c.done, d); err != nil {
@@ -271,14 +350,27 @@ func (c *Conn) Write(p []byte) (int, error) {
 			c.terminate(errors.New("queqiao: send offset overflow"))
 			return written, errors.New("queqiao: send offset overflow")
 		}
-		c.sendNext += uint64(n)
 		c.mu.Unlock()
-		if err := c.send(frame{typ: typeData, sequence: offset, payload: p[:n]}, true); err != nil {
-			c.terminate(err)
+		accepted := false
+		err := c.sendWithCommit(frame{typ: typeData, sequence: offset, payload: p[:n]}, true, func() {
+			c.sendNext += uint64(n)
+			if c.join != nil {
+				c.replay = append(c.replay, segment{offset, append([]byte(nil), p[:n]...)})
+			}
+			accepted = true
+		})
+		// With recovery enabled, these bytes were accepted into the replay
+		// buffer even if the caller's deadline expires during the outage.
+		if err == nil || c.join != nil && accepted {
+			written += n
+			p = p[n:]
+		}
+		if err != nil {
+			if c.join == nil && accepted {
+				c.terminate(err)
+			}
 			return written, err
 		}
-		written += n
-		p = p[n:]
 	}
 	return written, nil
 }
@@ -297,30 +389,58 @@ func (c *Conn) CloseWrite() error {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
-	c.localFIN = true
+	// Do not announce a recoverable FIN until every prior byte is cumulatively
+	// acknowledged. Otherwise a lost final ACK can make replay DATA arrive at
+	// the official gateway after it has irrevocably half-closed the destination.
+	for c.join != nil && c.acked < c.sendNext && !c.closed {
+		ch, d := c.changed, c.writeDeadline
+		c.mu.Unlock()
+		if err := waitChange(ch, c.done, d); err != nil {
+			return err
+		}
+		c.mu.Lock()
+	}
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
 	offset := c.sendNext
 	c.mu.Unlock()
-	if err := c.send(frame{typ: typeClose, flags: flagFIN, sequence: offset}, true); err != nil {
-		c.terminate(err)
+	accepted := false
+	if err := c.sendWithCommit(frame{typ: typeClose, flags: flagFIN, sequence: offset}, true, func() {
+		c.localFIN = true
+		accepted = true
+	}); err != nil {
+		if c.join == nil && accepted {
+			c.terminate(err)
+		}
 		return err
 	}
 	return nil
 }
 
 func (c *Conn) Close() error {
+	if c.bundle != nil {
+		return c.bundle.close()
+	}
+	c.mu.Lock()
+	if c.recoveryCancel != nil {
+		c.recoveryCancel()
+	}
+	c.mu.Unlock()
 	// Best-effort ABORT releases the gateway destination without its recovery
 	// grace. Never queue behind a blocked writer; closing the carrier must
 	// still interrupt all local operations within a bounded time.
 	select {
 	case <-c.writeGate:
 		c.mu.Lock()
-		closed, offset := c.closed, c.sendNext
-		if !closed {
-			c.Conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		closed, offset, raw := c.closed, c.sendNext, c.carrier
+		if !closed && raw != nil {
+			raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 		}
 		c.mu.Unlock()
-		if !closed {
-			_ = writeFrame(c.Conn, frame{typ: typeClose, flags: flagFIN | flagAbort, session: c.session, flow: c.flow, sequence: offset})
+		if !closed && raw != nil {
+			_ = writeFrame(raw, frame{typ: typeClose, flags: flagFIN | flagAbort, session: c.session, flow: c.flow, sequence: offset})
 		}
 		c.writeGate <- struct{}{}
 	default:
@@ -336,8 +456,11 @@ func (c *Conn) SetDeadline(t time.Time) error {
 		return net.ErrClosed
 	}
 	c.readDeadline, c.writeDeadline = t, t
-	if c.writingApplication {
-		c.Conn.SetWriteDeadline(t)
+	if c.bundle != nil {
+		c.bundle.setApplicationDeadlineLocked(t)
+	}
+	if c.writingApplication && c.carrier != nil {
+		c.carrier.SetWriteDeadline(t)
 	}
 	c.notifyLocked()
 	return nil
@@ -359,8 +482,11 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 		return net.ErrClosed
 	}
 	c.writeDeadline = t
-	if c.writingApplication {
-		c.Conn.SetWriteDeadline(t)
+	if c.bundle != nil {
+		c.bundle.setApplicationDeadlineLocked(t)
+	}
+	if c.writingApplication && c.carrier != nil {
+		c.carrier.SetWriteDeadline(t)
 	}
 	c.notifyLocked()
 	return nil
@@ -376,18 +502,32 @@ func (c *Conn) readLoop() {
 			<-ch
 			c.mu.Lock()
 		}
-		closed := c.closed
+		for c.carrier == nil && !c.closed {
+			ch := c.changed
+			c.mu.Unlock()
+			<-ch
+			c.mu.Lock()
+		}
+		closed, raw := c.closed, c.carrier
 		c.mu.Unlock()
 		if closed {
 			return
 		}
-		f, err := readFrame(c.Conn)
+		f, err := readFrame(raw)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
-			c.terminate(err)
+			if c.failCarrier(raw, err) {
+				continue
+			}
 			return
+		}
+		c.mu.Lock()
+		current := c.carrier == raw && !c.closed
+		c.mu.Unlock()
+		if !current {
+			continue
 		}
 		if f.session != c.session || f.flow != c.flow {
 			c.terminate(errors.New("queqiao: frame belongs to another flow"))
@@ -421,9 +561,13 @@ func (c *Conn) handleFrame(f frame) error {
 		if err == nil {
 			if f.sequence > c.acked {
 				c.acked = f.sequence
+				c.trimReplayLocked()
 			}
 			if f.flags&flagACKFinal != 0 {
 				c.localFinalACK = true
+				if c.onJoinedLane {
+					c.joinedFinalACK = true
+				}
 			}
 			c.notifyLocked()
 		}
@@ -453,6 +597,9 @@ func (c *Conn) handleFrame(f frame) error {
 			}
 		}
 		c.remoteFIN = true
+		if c.onJoinedLane {
+			c.joinedFIN = true
+		}
 		c.remoteFinal = f.sequence
 		final := c.recvNext == f.sequence
 		c.notifyLocked()
@@ -518,7 +665,7 @@ func (c *Conn) ackLoop() {
 
 func (c *Conn) finishIfComplete() {
 	c.mu.Lock()
-	finished := c.remoteFIN && c.recvNext == c.remoteFinal && c.remoteFinalACKSent && c.localFinalACK
+	finished := !c.recovering && c.remoteFIN && c.recvNext == c.remoteFinal && c.remoteFinalACKSent && c.localFinalACK
 	c.mu.Unlock()
 	if finished {
 		c.terminate(io.EOF)
@@ -532,6 +679,13 @@ func (c *Conn) insertLocked(offset uint64, data []byte) error {
 	end := offset + uint64(len(data))
 	if c.remoteFIN && end > c.remoteFinal {
 		return errors.New("queqiao: DATA beyond FIN")
+	}
+	if c.bundle != nil && c.queue.Len() > 0 {
+		queuedStart := c.recvNext - uint64(c.queue.Len())
+		start, stop := max(offset, queuedStart), min(end, c.recvNext)
+		if start < stop && !bytes.Equal(data[start-offset:stop-offset], c.queue.Bytes()[start-queuedStart:stop-queuedStart]) {
+			return errors.New("queqiao: conflicting unread DATA across lanes")
+		}
 	}
 	if end <= c.recvNext {
 		return nil
@@ -554,6 +708,12 @@ func (c *Conn) insertLocked(offset uint64, data []byte) error {
 			if sEnd <= old.offset || s.offset >= oldEnd {
 				next = append(next, s)
 				continue
+			}
+			if c.bundle != nil {
+				start, end := max(s.offset, old.offset), min(sEnd, oldEnd)
+				if !bytes.Equal(s.data[start-s.offset:end-s.offset], old.data[start-old.offset:end-old.offset]) {
+					return errors.New("queqiao: conflicting buffered DATA across lanes")
+				}
 			}
 			if s.offset < old.offset {
 				next = append(next, segment{s.offset, s.data[:old.offset-s.offset]})

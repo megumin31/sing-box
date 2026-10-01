@@ -21,6 +21,11 @@ import (
 
 func testIdentity(t *testing.T) (clientProfile, tls.Certificate, []*x509.Certificate) {
 	t.Helper()
+	return testIdentityExpires(t, time.Now().Add(time.Hour))
+}
+
+func testIdentityExpires(t *testing.T, expiry time.Time) (clientProfile, tls.Certificate, []*x509.Certificate) {
+	t.Helper()
 	now := time.Now()
 	serial := int64(0)
 	issue := func(parent *x509.Certificate, parentKey ed25519.PrivateKey, ca bool, usage x509.ExtKeyUsage, uri string) (*x509.Certificate, ed25519.PrivateKey) {
@@ -29,7 +34,7 @@ func testIdentity(t *testing.T) (clientProfile, tls.Certificate, []*x509.Certifi
 			t.Fatal(err)
 		}
 		serial++
-		template := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "synthetic-test"}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
+		template := &x509.Certificate{SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "synthetic-test"}, NotBefore: now.Add(-time.Hour), NotAfter: expiry, BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
 		if ca {
 			template.KeyUsage |= x509.KeyUsageCertSign
 			template.MaxPathLen = 0

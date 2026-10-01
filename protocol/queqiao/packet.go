@@ -1,6 +1,7 @@
 package queqiao
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -91,6 +92,8 @@ type udpPacket struct {
 
 type packetConn struct {
 	wire                       *Conn
+	resume                     udpResumeFunc
+	token                      [16]byte
 	queue                      []udpPacket
 	queueBytes                 int
 	window                     packetWindow
@@ -101,7 +104,13 @@ type packetConn struct {
 var _ net.PacketConn = (*packetConn)(nil)
 
 func newPacketConn(raw net.Conn, session [16]byte, flow uint64, onClose func()) *packetConn {
-	p := &packetConn{wire: newConnState(raw, session, flow, onClose)}
+	return newResumablePacketConn(raw, session, flow, onClose, nil, [16]byte{}, nil)
+}
+func newResumablePacketConn(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, token [16]byte, resume udpResumeFunc) *packetConn {
+	p := &packetConn{wire: newConnState(raw, session, flow, onClose), token: token, resume: resume}
+	if resume != nil {
+		p.wire.recoveryCtx, p.wire.recoveryCancel = context.WithCancel(ctx)
+	}
 	go p.readLoop()
 	return p
 }
@@ -144,32 +153,66 @@ func (p *packetConn) WriteTo(payload []byte, address net.Addr) (int, error) {
 	if address == nil {
 		return 0, errors.New("queqiao: UDP destination is required")
 	}
+	c := p.wire
+	if err := c.acquire(c.applicationGate, true); err != nil {
+		return 0, err
+	}
+	defer func() { c.applicationGate <- struct{}{} }()
+	// Only the active application writer owns an encoded packet. Waiting
+	// callers do not accumulate one copied datagram each during an outage.
 	encoded, err := encodePacket(address.String(), payload)
 	if err != nil {
 		return 0, err
 	}
-	c := p.wire
-	if err = c.acquire(c.applicationGate, true); err != nil {
-		return 0, err
-	}
-	defer func() { c.applicationGate <- struct{}{} }()
-	c.mu.Lock()
-	if c.closed || p.closing {
+	for {
+		if err = c.waitReady(true, time.Time{}); err != nil {
+			return 0, err
+		}
+		if err = c.acquire(c.writeGate, true); err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		if c.closed || p.closing {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			return 0, net.ErrClosed
+		}
+		if c.recovering || c.carrier == nil {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			continue
+		}
+		if p.next == math.MaxUint64 {
+			c.mu.Unlock()
+			c.writeGate <- struct{}{}
+			c.terminate(errors.New("queqiao: packet number exhausted"))
+			return 0, errors.New("queqiao: packet number exhausted")
+		}
+		f := frame{typ: typePacket, session: c.session, flow: c.flow, sequence: p.next, payload: encoded}
+		p.next++
+		raw := c.carrier
+		c.writingApplication = true
+		raw.SetWriteDeadline(c.writeDeadline)
 		c.mu.Unlock()
-		return 0, net.ErrClosed
-	}
-	if p.next == math.MaxUint64 {
+		err = writeFrame(raw, f)
+		c.mu.Lock()
+		c.writingApplication = false
+		raw.SetWriteDeadline(time.Time{})
 		c.mu.Unlock()
-		c.terminate(errors.New("queqiao: packet number exhausted"))
-		return 0, errors.New("queqiao: packet number exhausted")
-	}
-	sequence := p.next
-	p.next++
-	c.mu.Unlock()
-	if err = c.send(frame{typ: typePacket, sequence: sequence, payload: encoded}, true); err != nil {
-		// A timeout part-way through a record cannot be recovered on this lane.
-		c.terminate(err)
-		return 0, err
+		c.writeGate <- struct{}{}
+		if err != nil {
+			if !p.failCarrier(raw, err) {
+				return 0, err
+			}
+			// UDP permits loss. Consuming the ambiguous datagram after a
+			// successful reclaim keeps sing-box's packet-copy loop alive,
+			// without replaying a packet that may already have been delivered.
+			if err = c.waitReady(true, time.Time{}); err != nil {
+				return 0, err
+			}
+			return len(payload), nil
+		}
+		break
 	}
 	return len(payload), nil
 }
@@ -187,15 +230,24 @@ func (p *packetConn) Close() error {
 		return nil
 	}
 	p.closing = true
+	if c.recoveryCancel != nil {
+		c.recoveryCancel()
+	}
 	c.notifyLocked()
 	c.mu.Unlock()
 	// Do not queue CLOSE behind a blocked application writer. In that case,
-	// carrier cancellation releases the non-resumable association instead.
+	// carrier cancellation ends the local association instead.
 	select {
 	case <-c.writeGate:
+		raw := c.currentCarrier()
+		if raw == nil {
+			c.writeGate <- struct{}{}
+			c.terminate(net.ErrClosed)
+			return nil
+		}
 		deadline := time.Now().Add(udpCloseTimeout)
-		c.Conn.SetWriteDeadline(deadline)
-		err := writeFrame(c.Conn, frame{typ: typeClose, flags: flagFIN, session: c.session, flow: c.flow})
+		raw.SetWriteDeadline(deadline)
+		err := writeFrame(raw, frame{typ: typeClose, flags: flagFIN, session: c.session, flow: c.flow})
 		c.writeGate <- struct{}{}
 		if err == nil {
 			timer := time.NewTimer(time.Until(deadline))
@@ -214,15 +266,32 @@ func (p *packetConn) Close() error {
 func (p *packetConn) readLoop() {
 	c := p.wire
 	for {
-		f, err := readFrame(c.Conn)
+		if err := c.waitReady(false, time.Time{}); err != nil {
+			return
+		}
+		c.mu.Lock()
+		raw, session, flow := c.carrier, c.session, c.flow
+		c.mu.Unlock()
+		if raw == nil {
+			continue
+		}
+		f, err := readFrame(raw)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				err = io.ErrUnexpectedEOF
 			}
-			c.terminate(err)
+			if p.failCarrier(raw, err) {
+				continue
+			}
 			return
 		}
-		if f.session != c.session || f.flow != c.flow {
+		c.mu.Lock()
+		stale := raw != c.carrier || c.closed
+		c.mu.Unlock()
+		if stale {
+			continue
+		}
+		if f.session != session || f.flow != flow {
 			c.terminate(errors.New("queqiao: packet belongs to another association"))
 			return
 		}
@@ -243,7 +312,7 @@ func (p *packetConn) readLoop() {
 				return
 			}
 			c.mu.Lock()
-			if !c.closed && !p.closing && p.window.accept(f.sequence) && len(p.queue) < maxQueuedPackets && p.queueBytes+len(payload) <= receiveLimit {
+			if !c.closed && raw == c.carrier && !p.closing && p.window.accept(f.sequence) && len(p.queue) < maxQueuedPackets && p.queueBytes+len(payload) <= receiveLimit {
 				p.queue = append(p.queue, udpPacket{payload: append([]byte(nil), payload...), source: net.UDPAddrFromAddrPort(numeric)})
 				p.queueBytes += len(payload)
 				c.notifyLocked()
@@ -271,7 +340,14 @@ func (p *packetConn) readLoop() {
 			p.closing = true
 			c.notifyLocked()
 			c.mu.Unlock()
-			_ = c.send(frame{typ: typeACK, flags: flagACKFinal}, false)
+			// Peer Close is terminal, including during a concurrent lane failure.
+			select {
+			case <-c.writeGate:
+				raw.SetWriteDeadline(time.Now().Add(udpCloseTimeout))
+				_ = writeFrame(raw, frame{typ: typeACK, flags: flagACKFinal, session: session, flow: flow})
+				c.writeGate <- struct{}{}
+			default:
+			}
 			c.terminate(net.ErrClosed)
 			return
 		case typeReset:

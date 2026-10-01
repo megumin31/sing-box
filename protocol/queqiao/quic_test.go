@@ -56,6 +56,19 @@ func TestQUICNoDatagramsAndFinalACK(t *testing.T) {
 			done <- errors.New("client enabled DATAGRAM or 0-RTT")
 			return
 		}
+		// Retire stream 0 first: final-frame draining must use the actual
+		// pooled stream ID instead of accidentally tracking only the first.
+		warm, err := connection.AcceptStream(ctx)
+		if err != nil {
+			done <- err
+			return
+		}
+		data, err := io.ReadAll(warm)
+		if err != nil || string(data) != "warm" {
+			done <- errors.New("warm stream failed")
+			return
+		}
+		warm.Close()
 		stream, err := connection.AcceptStream(ctx)
 		if err != nil {
 			done <- err
@@ -114,11 +127,24 @@ func TestQUICNoDatagramsAndFinalACK(t *testing.T) {
 		}
 		done <- nil
 	}()
+	warm, err := o.pool.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = warm.Write([]byte("warm")); err != nil {
+		t.Fatal(err)
+	}
+	if err = warm.Close(); err != nil {
+		t.Fatal(err)
+	}
 	c, err := o.DialContext(ctx, "tcp", M.ParseSocksaddr("example.com:443"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	if c.(*Conn).currentCarrier().(*quicCarrier).StreamID() == 0 {
+		t.Fatal("final ACK test did not use a pooled stream")
+	}
 	c.SetDeadline(time.Now().Add(3 * time.Second))
 	if err = c.(*Conn).CloseWrite(); err != nil {
 		t.Fatal(err)
@@ -274,4 +300,78 @@ func TestQUICCloseInterruptsBlockedStreamWrite(t *testing.T) {
 	}
 	cancel()
 	<-serverDone
+}
+
+func breakTestCarrier(c *Conn, shared bool) {
+	raw := c.currentCarrier()
+	if carrier, ok := raw.(*quicCarrier); ok && shared {
+		carrier.connection.CloseWithError(0, "local test fault")
+	} else {
+		abortCarrier(raw)
+	}
+}
+
+func assertTestSharedCarrier(t *testing.T, conns []*Conn) {
+	t.Helper()
+	first := conns[0].currentCarrier().(*quicCarrier).connection
+	for _, c := range conns {
+		if c.currentCarrier().(*quicCarrier).connection != first {
+			t.Fatal("fault test flows do not share one connection")
+		}
+	}
+}
+
+func TestRecoveryRejectsExpiredQUICIdentity(t *testing.T) {
+	profile, certificate, _ := testIdentityExpires(t, time.Now().Add(2*time.Second))
+	o := poolTestOutboundIdentity(t, profile, certificate)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := o.pool.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newRecoverableConn(raw, [16]byte{1}, 2, nil, context.Background(), func(ctx context.Context, s [16]byte, f, lane uint64) (net.Conn, error) {
+		return o.joinFlow(ctx, M.ParseSocksaddr("example.com:443"), 0, s, f, lane)
+	})
+	defer c.Close()
+	select {
+	case <-c.done:
+	case <-ctx.Done():
+		t.Fatal("QUIC credential expiry did not terminate recovery")
+	}
+	c.mu.Lock()
+	attempts, failure := c.recoveryAttempts, c.err
+	c.mu.Unlock()
+	var invalid identityError
+	if !errors.As(failure, &invalid) || attempts != 1 {
+		t.Fatalf("QUIC expiry attempts=%d error=%v", attempts, failure)
+	}
+}
+
+func TestUDPResumeRejectsExpiredQUICIdentity(t *testing.T) {
+	profile, certificate, _ := testIdentityExpires(t, time.Now().Add(2*time.Second))
+	o := poolTestOutboundIdentity(t, profile, certificate)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw, err := o.pool.Open(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newResumablePacketConn(raw, [16]byte{1}, 2, nil, context.Background(), [16]byte{1}, func(ctx context.Context, token [16]byte) (*udpReplacement, error) {
+		return o.resumeUDP(ctx, M.ParseSocksaddr("example.com:53"), 0, token)
+	})
+	defer p.Close()
+	c := p.wire
+	select {
+	case <-c.done:
+	case <-ctx.Done():
+		t.Fatal("QUIC credential expiry did not terminate recovery")
+	}
+	c.mu.Lock()
+	attempts, failure := c.recoveryAttempts, c.err
+	c.mu.Unlock()
+	var invalid identityError
+	if !errors.As(failure, &invalid) || attempts != 1 {
+		t.Fatalf("QUIC expiry attempts=%d error=%v", attempts, failure)
+	}
 }
