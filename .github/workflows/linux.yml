@@ -17,6 +17,7 @@ on:
 
 jobs:
   calculate_version:
+    if: github.repository == 'SagerNet/sing-box'
     name: Calculate version
     runs-on: ubuntu-latest
     outputs:
