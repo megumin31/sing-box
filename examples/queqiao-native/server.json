@@ -1,0 +1,34 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "queqiao",
+      "tag": "gateway",
+      "listen": "0.0.0.0",
+      "listen_port": 8443,
+      "credentials_path": "./gateway-credentials.json",
+      "transport": "auto",
+      "max_sessions": 16,
+      "quic_idle_timeout": "20s",
+      "users": [
+        {
+          "name": "my-device",
+          "account_id": "<ACCOUNT_ID_32_LOWER_HEX>",
+          "device_id": "<DEVICE_ID_32_LOWER_HEX>",
+          "public_key": "<DEVICE_ED25519_PUBLIC_KEY_RAW_URL_BASE64>"
+        }
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}

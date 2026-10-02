@@ -1,6 +1,7 @@
 package queqiao
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -122,14 +123,26 @@ func (c acceptedErrorConn) Write(b []byte) (int, error) {
 	return n, err
 }
 func TestUDPResumeAmbiguousWriteIsNotReplayed(t *testing.T) {
+	testUDPResumeAmbiguousWriteIsNotReplayed(t, false)
+}
+
+func TestActiveFallbackUDPDoesNotReplayAmbiguousWrite(t *testing.T) {
+	testUDPResumeAmbiguousWriteIsNotReplayed(t, true)
+}
+
+func testUDPResumeAmbiguousWriteIsNotReplayed(t *testing.T, active bool) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := net.Pipe()
 		defer b.Close()
 		next, peer := net.Pipe()
 		defer peer.Close()
-		p := newResumablePacketConn(acceptedErrorConn{a}, [16]byte{1}, 1, nil, context.Background(), [16]byte{1}, func(context.Context, [16]byte) (*udpReplacement, error) {
+		h := newCarrierHandoff(false, active)
+		p := newResumablePacketConnWithPolicy(acceptedErrorConn{a}, [16]byte{1}, 1, nil, context.Background(), [16]byte{1}, func(_ context.Context, token [16]byte) (*udpReplacement, error) {
+			if h.tcp() != active || token != ([16]byte{1}) {
+				t.Error("wrong UDP carrier or resume identity")
+			}
 			return &udpReplacement{conn: next, session: [16]byte{2}, flow: 2, token: [16]byte{2}}, nil
-		})
+		}, h.prepare)
 		defer p.Close()
 		original := make(chan frame, 1)
 		go func() { f, _ := readFrame(b); original <- f }()
@@ -146,18 +159,32 @@ func TestUDPResumeAmbiguousWriteIsNotReplayed(t *testing.T) {
 		synctest.Wait()
 		got := make(chan frame, 1)
 		go func() { f, _ := readFrame(peer); got <- f }()
-		if _, err := p.WriteTo([]byte("new"), destination); err != nil {
+		newPayload := []byte("new")
+		if active {
+			// Exercise the maximum migrated wire frame independently of the
+			// host UDP socket's (possibly smaller) native datagram limit.
+			newPayload = bytes.Repeat([]byte{0xab}, maxUDPDatagram)
+		}
+		if _, err := p.WriteTo(newPayload, destination); err != nil {
 			t.Fatal(err)
 		}
 		f = <-got
 		_, payload, _ = decodePacket(f.payload)
-		if string(payload) != "new" || f.sequence != 0 || f.flow != 2 {
-			t.Fatalf("old packet replayed or sequence retained: %+v %q", f, payload)
+		if !bytes.Equal(payload, newPayload) || f.sequence != 0 || f.flow != 2 {
+			t.Fatalf("old packet replayed or sequence retained: sequence=%d flow=%d payload_bytes=%d", f.sequence, f.flow, len(payload))
 		}
 		peer.Close()
 	})
 }
 func TestUDPResumeCancellationAndDeadline(t *testing.T) {
+	testUDPResumeCancellationAndDeadline(t, false)
+}
+
+func TestActiveFallbackUDPCancellationAndDeadline(t *testing.T) {
+	testUDPResumeCancellationAndDeadline(t, true)
+}
+
+func testUDPResumeCancellationAndDeadline(t *testing.T, active bool) {
 	for _, kind := range []string{"close-backoff", "close-open", "read-deadline", "write-deadline", "permanent", "budget"} {
 		t.Run(kind, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -166,7 +193,11 @@ func TestUDPResumeCancellationAndDeadline(t *testing.T) {
 				entered := make(chan struct{})
 				cancelled := make(chan struct{})
 				var attempts atomic.Int32
-				p := newResumablePacketConn(a, [16]byte{1}, 1, nil, context.Background(), [16]byte{1}, func(ctx context.Context, _ [16]byte) (*udpReplacement, error) {
+				h := newCarrierHandoff(false, active)
+				p := newResumablePacketConnWithPolicy(a, [16]byte{1}, 1, nil, context.Background(), [16]byte{1}, func(ctx context.Context, _ [16]byte) (*udpReplacement, error) {
+					if h.tcp() != active {
+						t.Error("resume selected wrong carrier")
+					}
 					attempts.Add(1)
 					if kind == "permanent" {
 						return nil, identityError{errors.New("expired")}
@@ -178,7 +209,7 @@ func TestUDPResumeCancellationAndDeadline(t *testing.T) {
 					<-ctx.Done()
 					close(cancelled)
 					return nil, ctx.Err()
-				})
+				}, h.prepare)
 				defer p.Close()
 				b.Close()
 				synctest.Wait()

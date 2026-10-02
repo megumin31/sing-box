@@ -230,7 +230,7 @@ func TestInitialFallbackSelectedTLSCallbacks(t *testing.T) {
 				}
 			}
 			if quicCalls.Load() != 1 || tcpCalls.Load() != 2 || verifiedClient.Load() != 2 || verifiedServer.Load() != 2 {
-				t.Fatal("callback retried QUIC or skipped mutual authentication")
+				t.Fatalf("callback retried QUIC or skipped mutual authentication: QUIC=%d TCP=%d clientVerified=%d serverVerified=%d", quicCalls.Load(), tcpCalls.Load(), verifiedClient.Load(), verifiedServer.Load())
 			}
 			// done precedes onClose's resource release. Observe normal
 			// quiescence without clearing state or forcing outbound cleanup.

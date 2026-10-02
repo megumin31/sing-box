@@ -37,10 +37,15 @@ func permanentRecoveryError(err error) bool {
 	var reset gatewayResetError
 	var protocol protocolError
 	var identity identityError
+	// A capacity marker in a joined error must not conceal a terminal
+	// identity/protocol refusal (including an active handoff admission error).
+	if errors.As(err, &protocol) || errors.As(err, &identity) {
+		return true
+	}
 	if errors.As(err, &reset) {
 		return reset.code != 4
 	} // only capacity can heal
-	return errors.As(err, &protocol) || errors.As(err, &identity)
+	return false
 }
 
 func (c *Conn) waitReady(application bool, controlDeadline time.Time) error {
@@ -91,7 +96,7 @@ func (c *Conn) failCarrier(raw net.Conn, err error) bool {
 		c.mu.Unlock()
 		return true
 	}
-	if c.join == nil || c.remoteAbort || permanentRecoveryError(err) {
+	if c.join == nil || c.remoteAbort || permanentRecoveryError(err) || c.beforeRecovery != nil && !c.beforeRecovery(err) {
 		c.mu.Unlock()
 		c.terminate(err)
 		return false

@@ -3,6 +3,7 @@ package queqiao
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,6 +20,10 @@ import (
 )
 
 func testOfficialTCPRecovery(t *testing.T, profile, transport string) {
+	testOfficialTCPRecoveryWithHandoff(t, profile, transport, false)
+}
+
+func testOfficialTCPRecoveryWithHandoff(t *testing.T, profile, transport string, active bool) {
 	target, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +46,7 @@ func testOfficialTCPRecovery(t *testing.T, profile, transport string) {
 		}
 	}()
 	destination := M.ParseSocksaddr(target.Addr().String())
-	a, err := NewOutbound(context.Background(), nil, nil, "recovery", option.QueqiaoOutboundOptions{ProfilePath: profile, Transport: transport, TCPRecovery: true})
+	a, err := NewOutbound(context.Background(), nil, nil, "recovery", option.QueqiaoOutboundOptions{ProfilePath: profile, Transport: transport, TCPRecovery: true, Network: "tcp", QUICActiveFallback: active})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +74,35 @@ func testOfficialTCPRecovery(t *testing.T, profile, transport string) {
 	if _, err = io.ReadFull(c, prefix); err != nil {
 		t.Fatal(err)
 	}
+	session, flow := c.session, c.flow
+	oldCarrier := c.currentCarrier()
 	breakTestCarrier(c, true)
+	if active {
+		// Synchronize fault notification; buffered downstream bytes alone do
+		// not prove that the replacement has finished JOIN and replay.
+		c.failCarrier(oldCarrier, io.EOF)
+		for range 2 {
+			next := make([]byte, 256<<10)
+			if _, err = io.ReadFull(c, next); err != nil {
+				t.Fatal(err)
+			}
+			prefix = append(prefix, next...)
+			if err = c.waitReady(false, time.Now().Add(8*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := c.currentCarrier().(*tls.Conn); !ok {
+				t.Fatal("replacement is not TLS/TCP")
+			}
+			if c.session != session || c.flow != flow {
+				t.Fatal("TCP logical identity changed")
+			}
+			if len(prefix) == 512<<10 {
+				oldCarrier = c.currentCarrier()
+				breakTestCarrier(c, true)
+				c.failCarrier(oldCarrier, io.EOF)
+			}
+		}
+	}
 	rest, err := io.ReadAll(c)
 	if err != nil {
 		t.Fatalf("recovered read: %v", err)
@@ -219,11 +252,27 @@ func TestRecoveryWindowAndSelectiveACK(t *testing.T) {
 }
 
 func TestRecoveryPartialReplayAndDownstreamDedup(t *testing.T) {
+	testRecoveryPartialReplayAndDownstreamDedup(t, false, false)
+}
+
+func TestActiveFallbackPartialReplayAndDownstreamDedup(t *testing.T) {
+	testRecoveryPartialReplayAndDownstreamDedup(t, true, false)
+}
+
+func TestActiveFallbackIsolatedPartialReplayAndDownstreamDedup(t *testing.T) {
+	testRecoveryPartialReplayAndDownstreamDedup(t, true, true)
+}
+
+func testRecoveryPartialReplayAndDownstreamDedup(t *testing.T, active, isolated bool) {
 	client, peer := net.Pipe()
 	session := [16]byte{1}
 	flow := uint64(2)
 	replayed := make(chan frame, 1)
-	c := newRecoverableConn(client, session, flow, nil, context.Background(), func(ctx context.Context, s [16]byte, f, lane uint64) (net.Conn, error) {
+	h := newCarrierHandoff(false, active)
+	join := func(ctx context.Context, s [16]byte, f, lane uint64) (net.Conn, error) {
+		if s != session || f != flow || lane == 0 || h.tcp() != active {
+			t.Error("replacement changed identity or selected wrong carrier")
+		}
 		local, remote := net.Pipe()
 		go func() {
 			defer remote.Close()
@@ -233,10 +282,22 @@ func TestRecoveryPartialReplayAndDownstreamDedup(t *testing.T) {
 				t.Errorf("replacement downstream prefix: %+v %v", first, e)
 				return
 			}
-			data, e := readFrame(remote)
-			if e != nil {
-				t.Error(e)
-				return
+			var data frame
+			for range 16 {
+				data, e = readFrame(remote)
+				if e != nil {
+					t.Error(e)
+					return
+				}
+				if data.typ != typeACK {
+					break
+				}
+				// The coalescing ACK worker and replay worker may both send
+				// the same authenticated cumulative ACK during role handoff.
+				if data.session != session || data.flow != flow || data.flags != flagACKDown || data.sequence != 4 || len(data.payload) != 0 {
+					t.Errorf("unexpected recovery ACK: %+v", data)
+					return
+				}
 			}
 			replayed <- data
 			send := func(f frame) error { f.session, f.flow = session, flow; return writeFrame(remote, f) }
@@ -267,12 +328,22 @@ func TestRecoveryPartialReplayAndDownstreamDedup(t *testing.T) {
 			}
 		}()
 		return local, nil
-	})
+	}
+	var c *Conn
+	writePeer := peer
+	if isolated {
+		data, dataPeer := net.Pipe()
+		defer dataPeer.Close()
+		writePeer = dataPeer
+		c = newQUICRoleConnWithPolicy(client, data, session, flow, nil, context.Background(), join, h.prepare)
+	} else {
+		c = newRecoverableConnWithPolicy(client, session, flow, nil, context.Background(), join, h.prepare)
+	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(3 * time.Second))
 	go func() {
 		defer peer.Close()
-		if _, err := readFrame(peer); err != nil {
+		if _, err := readFrame(writePeer); err != nil {
 			return
 		}
 		writeFrame(peer, frame{typ: typeACK, flags: flagACKUp, session: session, flow: flow, sequence: 4})

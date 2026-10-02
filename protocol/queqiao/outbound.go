@@ -48,6 +48,7 @@ type Outbound struct {
 	tcpLanes        int
 	udpResume       bool
 	initialFallback bool
+	activeFallback  bool
 	pathProbe       bool
 	dataIsolation   bool
 	logger          log.ContextLogger
@@ -84,6 +85,18 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.QUICInitialFallback && transport != "quic" {
 		return nil, errors.New("queqiao: quic_initial_fallback requires transport quic")
 	}
+	if options.QUICActiveFallback {
+		if transport != "quic" {
+			return nil, errors.New("queqiao: quic_active_fallback requires transport quic")
+		}
+		networks := options.Network.Build()
+		if slices.Contains(networks, N.NetworkTCP) && !options.TCPRecovery {
+			return nil, errors.New("queqiao: quic_active_fallback for TCP requires tcp_recovery")
+		}
+		if slices.Contains(networks, N.NetworkUDP) && !options.UDPResume {
+			return nil, errors.New("queqiao: quic_active_fallback for UDP requires udp_resume")
+		}
+	}
 	switch transport {
 	case "tcp":
 	case "quic":
@@ -106,6 +119,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	o := &Outbound{Adapter: outbound.NewAdapterWithDialerOptions(C.TypeQueqiao, tag, options.Network.Build(), options.DialerOptions), dialer: d, server: server, tlsConfig: config, transport: transport, tcpRecovery: options.TCPRecovery, udpResume: options.UDPResume, active: make(map[net.Conn]io.Closer), ctx: lifetime, cancel: cancel, slots: make(chan struct{}, 256)}
 	o.tcpLanes = max(1, options.TCPLanes)
 	o.initialFallback = options.QUICInitialFallback
+	o.activeFallback = options.QUICActiveFallback
 	o.pathProbe, o.logger = options.QUICPathProbe, logger
 	o.dataIsolation = options.QUICDataIsolation
 	if transport == "quic" {
@@ -130,15 +144,26 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 			return nil, err
 		}
 		var join joinLaneFunc
+		var handoff *carrierHandoff
+		var beforeRecovery func(error) bool
 		if o.tcpRecovery {
+			handoff = newCarrierHandoff(opened.useTCP, o.activeFallback)
+			if o.activeFallback {
+				beforeRecovery = handoff.prepare
+			}
 			join = func(ctx context.Context, session [16]byte, flow, lane uint64) (net.Conn, error) {
-				return o.joinFlowOnTransport(ctx, destination, opened.generation, session, flow, lane, opened.useTCP)
+				raw, err := o.joinFlowOnTransport(ctx, destination, opened.generation, session, flow, lane, handoff.tcp())
+				return raw, handoff.replacementError(err)
 			}
 		}
 		var c *Conn
 		if o.dataIsolation && !opened.useTCP {
 			controlJoin := func(ctx context.Context, session [16]byte, flow, lane uint64) (net.Conn, error) {
-				return o.joinLaneOnTransport(ctx, destination, opened.generation, session, flow, lane, false, flagReserve, false)
+				if handoff.tcp() {
+					return join(ctx, session, flow, lane)
+				}
+				raw, err := o.joinLaneOnTransport(ctx, destination, opened.generation, session, flow, lane, false, flagReserve, false)
+				return raw, handoff.replacementError(err)
 			}
 			dataJoin := func(ctx context.Context, session [16]byte, flow, lane uint64) (net.Conn, error) {
 				return o.joinLaneOnTransport(ctx, destination, opened.generation, session, flow, lane, false, 0, true)
@@ -149,7 +174,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 				abortInitialBundleFlow(ctx, opened)
 				return nil, joinErr
 			}
-			c = newQUICRoleConn(opened.conn, second, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), controlJoin)
+			c = newQUICRoleConnWithPolicy(opened.conn, second, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), controlJoin, beforeRecovery)
 		} else if o.tcpLanes == 2 {
 			second, joinErr := joinInitialBundleLane(ctx, join, opened.session, opened.flow)
 			if joinErr != nil {
@@ -158,7 +183,7 @@ func (o *Outbound) DialContext(ctx context.Context, network string, destination 
 			}
 			c = newBundleConn(opened.conn, second, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), join)
 		} else {
-			c = newRecoverableConn(opened.conn, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), join)
+			c = newRecoverableConnWithPolicy(opened.conn, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), join, beforeRecovery)
 		}
 		if err = opened.install(c); err != nil {
 			c.Close()
@@ -340,13 +365,20 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	}
 	var resume udpResumeFunc
 	var token [16]byte
+	var handoff *carrierHandoff
+	var beforeRecovery func(error) bool
 	if o.udpResume {
 		_, token, _ = decodeUDPGrant(opened.grant)
+		handoff = newCarrierHandoff(opened.useTCP, o.activeFallback)
+		if o.activeFallback {
+			beforeRecovery = handoff.prepare
+		}
 		resume = func(ctx context.Context, token [16]byte) (*udpReplacement, error) {
-			return o.resumeUDPOnTransport(ctx, destination, opened.generation, token, opened.useTCP)
+			replacement, err := o.resumeUDPOnTransport(ctx, destination, opened.generation, token, handoff.tcp())
+			return replacement, handoff.replacementError(err)
 		}
 	}
-	c := newResumablePacketConn(opened.conn, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), token, resume)
+	c := newResumablePacketConnWithPolicy(opened.conn, opened.session, opened.flow, opened.remove, context.WithoutCancel(ctx), token, resume, beforeRecovery)
 	if err = opened.install(c); err != nil {
 		c.Close()
 		return nil, err

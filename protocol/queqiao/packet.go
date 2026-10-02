@@ -108,6 +108,12 @@ type packetConn struct {
 var _ net.PacketConn = (*packetConn)(nil)
 var _ N.NetPacketConn = (*packetConn)(nil)
 
+// Advertise protocol payload capacity to sing-box's packet-copy buffer sizing.
+// Its default 16 KiB packet buffer would otherwise silently truncate a valid
+// large datagram before or after Queqiao's own bounded PACKET codec.
+func (p *packetConn) ReaderMTU() int { return maxUDPDatagram }
+func (p *packetConn) WriterMTU() int { return maxUDPDatagram }
+
 // Keep structured destinations intact through sing-box's packet-copy path.
 // A net.UDPAddr cannot represent a domain; the generic net.PacketConn adapter
 // would discard its Fqdn before WriteTo could encode the gateway destination.
@@ -129,7 +135,11 @@ func newPacketConn(raw net.Conn, session [16]byte, flow uint64, onClose func()) 
 	return newResumablePacketConn(raw, session, flow, onClose, nil, [16]byte{}, nil)
 }
 func newResumablePacketConn(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, token [16]byte, resume udpResumeFunc) *packetConn {
+	return newResumablePacketConnWithPolicy(raw, session, flow, onClose, ctx, token, resume, nil)
+}
+func newResumablePacketConnWithPolicy(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, token [16]byte, resume udpResumeFunc, beforeRecovery func(error) bool) *packetConn {
 	p := &packetConn{wire: newConnState(raw, session, flow, onClose), token: token, resume: resume}
+	p.wire.beforeRecovery = beforeRecovery
 	if resume != nil {
 		p.wire.recoveryCtx, p.wire.recoveryCancel = context.WithCancel(ctx)
 	}

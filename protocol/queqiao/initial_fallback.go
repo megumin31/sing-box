@@ -22,7 +22,8 @@ func (e quicStreamOpenError) Unwrap() error { return e.error }
 // dialInitialCarrier runs before any Queqiao OPEN is written. A fallback TCP
 // socket is still unauthenticated here; openFlow must run the same TLS profile
 // handshake as explicit TCP before sending OPEN. Existing flows never use this
-// selection again: JOIN and UDP resume retain their initial chosen transport.
+// selection again. Only the separate opt-in active carrier policy can hand off
+// an already open logical flow through JOIN or token-bound UDP resume.
 func (o *Outbound) dialInitialCarrier(ctx context.Context, generation uint64) (net.Conn, bool, error) {
 	if err := o.initialDialState(ctx, generation); err != nil {
 		return nil, false, err
@@ -85,6 +86,9 @@ func (o *Outbound) initialDialState(ctx context.Context, generation uint64) erro
 
 // dialFixedCarrier never reselects transport during logical-flow recovery.
 func (o *Outbound) dialFixedCarrier(ctx context.Context, useTCP bool) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if useTCP {
 		return o.dialer.DialContext(ctx, "tcp", o.server)
 	}

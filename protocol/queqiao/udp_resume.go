@@ -100,7 +100,7 @@ func (p *packetConn) failCarrier(raw net.Conn, err error) bool {
 		c.mu.Unlock()
 		return true
 	}
-	if p.resume == nil || permanentRecoveryError(err) {
+	if p.resume == nil || permanentRecoveryError(err) || c.beforeRecovery != nil && !c.beforeRecovery(err) {
 		c.mu.Unlock()
 		c.terminate(err)
 		return false

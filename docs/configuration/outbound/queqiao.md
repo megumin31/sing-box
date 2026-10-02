@@ -1,8 +1,8 @@
 # Queqiao
 
 Native Queqiao protocol-1 outbound for TCP and UDP over reliable TLS/TCP or QUIC
-streams. Basic reliable-mode implementation and the bounded Linux functional
-qualification below are complete. This remains a preview release: it does not
+streams. The native inbound/outbound pair has bounded Linux qualification. This is a
+preview release: it does not
 claim every optional Queqiao feature or production WAN qualification.
 
 ```json
@@ -12,6 +12,7 @@ claim every optional Queqiao feature or production WAN qualification.
   "profile_path": "/etc/sing-box/queqiao-profile.json",
   "transport": "tcp",
   "quic_initial_fallback": false,
+  "quic_active_fallback": false,
   "quic_path_probe": false,
   "quic_data_isolation": false,
   "tcp_recovery": false,
@@ -53,8 +54,9 @@ changes, not hidden native-client behavior. In particular, the corrected UDP
 handover must not be assumed when connecting to an unpatched gateway.
 
 Protocol-1 explicitly permits QUIC without DATAGRAM (protocol §11). Reliable
-TCP/UDP support does not imply live FEC, active-flow cross-carrier migration, or
-performance equivalent to every official-client policy.
+TCP/UDP support does not imply live FEC or performance equivalent to every
+official-client policy. The opt-in active handoff below has bounded local
+qualification; it is not complete protocol or production WAN qualification.
 
 A minimal full-program SOCKS configuration using the TLS/TCP carrier is:
 
@@ -114,6 +116,55 @@ Idle connections expire after 30 seconds; interface changes discard the pool.
 A shared handshake preserves the initiating flow's common-dialer context values,
 but one canceled waiter cannot cancel other waiting flows.
 
+### quic_active_fallback
+
+Optional, **false by default**. The current candidate passed bounded Linux amd64
+native full-program kr2-to-de tests for ordinary and isolated DATA carrier handoff,
+including concurrent flows, request half-close, unacknowledged replay, destination
+deduplication, UDP relay retention and frontend TCP reset cancellation. Current-source Linux race execution passed with and without `with_quic`;
+see the native acceptance section for counts, skipped suites and finite limits.
+
+Requires `"transport": "quic"`, a `with_quic` build, and both carriers at the same
+profile endpoint. Enabled TCP networks require `tcp_recovery`; enabled UDP
+networks require `udp_resume`. When combined with `quic_data_isolation`, carrier
+loss atomically retires both QUIC roles and sends an ordinary TCP JOIN without
+the reserved-control flag. QUIC role restoration is disabled for the remaining
+flow lifetime. This combination passed the controlled native two-endpoint check.
+
+After an established reliable QUIC carrier fails with a recognized path loss or
+clean carrier close, this logical flow selects TLS/TCP for its remaining lifetime.
+Identity, certificate, protocol, nonzero QUIC peer errors, permission failures,
+application deadlines, cancellation and unclassified failures terminate the flow
+rather than initiate handoff. A parsed refusal remains terminal if cancellation
+races with its response. TCP selection is sticky even when a JOIN response is
+lost, since the gateway may already have retired its QUIC lanes. New flows still
+try QUIC first; there is no outbound-wide cooldown or performance-based switching.
+
+TCP uses authenticated JOIN with the original session/flow IDs and a fresh lane
+ID, preserving the destination socket, replay offsets, downstream deduplication,
+and FIN state. The existing three lifetime JOIN attempts, 40-second outage limit,
+5-second attempt limit and bounded replay window apply. TLS uses the immutable
+profile identity and endpoint, with generation checks before and after admission.
+
+UDP sends the original single-use resume token over authenticated TLS, requires
+a resumed grant, rotates its wire session/flow IDs and token, and resets sequence
+windows. It never replays packets; a datagram accepted by a failed write has
+indeterminate delivery. A fresh relay grant is rejected because it changes the
+source endpoint. The native inbound includes relay-reader handover; an external companion
+gateway must include its corresponding fix.
+The existing three lifetime resume attempts and 20-second outage limit apply.
+UDP handoff does not provide lossless or exactly-once delivery.
+
+The real-socket UDP migration test checks an initial echo, then uses single-send
+probes at 0, 1, 1200 and 8192 bytes after each replacement. Its 65507-byte probe is included only when an
+independent local socket supports that size; only `EMSGSIZE` permits exclusion.
+On this Mac, the kernel returned `EMSGSIZE`, so that real-socket size remains
+unqualified. A separate migrated `net.Pipe` PACKET test passed at the full
+65507-byte protocol limit. No sysctl or other system settings were changed.
+
+See [the independent migration audit](../../../queqiao-active-migration-audit.md)
+for frozen protocol evidence, actual test results and remaining qualification gaps.
+
 ### quic_initial_fallback
 
 Optional, **false by default**. Requires `"transport": "quic"` and a `with_quic`
@@ -134,7 +185,8 @@ a shorter caller deadline takes precedence. There is no parallel race, persisten
 preference or shared TCP cooldown: each new flow still tries QUIC first. TLS/TCP
 uses the same profile's TLS 1.3, mutual authentication, root pin, gateway URI and
 ALPN verification. If `tcp_recovery` or `udp_resume` is enabled, subsequent recovery
-for that flow retains the transport actually selected at initial setup.
+for that flow retains the transport actually selected at initial setup unless
+`quic_active_fallback` is also enabled.
 
 This new option has passed offline selection, error-classification, budget and
 cleanup tests, plus TLS 1.3 mutual authentication, one OPEN and data echo over an
@@ -414,12 +466,31 @@ This version includes an offline FEC codec and fragment reassembly module verifi
 with conformance vectors, budget tests and fuzzing. It is not connected to the
 network send/receive paths. The outbound does not negotiate DATAGRAM; the offline
 module does not provide live FEC/coded DATAGRAM support. Active-flow cross-carrier
-migration, automatic data-lane refill, enrollment and automatic renewal remain
-unimplemented. The explicit two-TCP-lane and QUIC control/data options above are
+migration is implemented by the opt-in option above. Automatic data-lane refill,
+enrollment and automatic renewal remain unimplemented. The explicit two-TCP-lane
+and QUIC control/data options above are
 implemented; they do not provide arbitrary lane scheduling. No claim is made to
 reproduce Queqiao's full protocol surface or WAN performance optimizations.
 
 ## Verification status and known limitations
+
+The current native inbound/outbound pair passed a finite Linux amd64 kr2-to-de
+matrix: normal TLS/TCP, pure QUIC without TCP fallback, ordinary active handoff,
+and isolated DATA handoff. Three concurrent TCP flows retained exact bytes and
+destination accept counts; UDP single-send probes at 1,200, 8,192 and 65,497 bytes
+passed after handoff with the same destination-observed source endpoint. Explicit
+frontend TCP reset did not revive the canceled flow. Target sockets were reclaimed.
+The native router's final-ACK completion fix passed two tests repeated 20 times.
+Current package pass events were 504 (`with_quic`) and 446 (without), excluding
+opt-in companion/long-run suites. Those earlier non-race results are supplemented by the current-source race
+and 900-second native windows below; they do not establish production stability
+or live coded DATAGRAM support.
+
+With gateway `quic_idle_timeout: "20s"`, reverse QUIC loss to observation of four
+replacement upstream TCP connections measured 21.060/21.029 seconds. The complete
+cases took 35.392/32.944 seconds. Application interruption and completed TLS/JOIN
+latency were not separately measured. The native inbound allows idle timeout
+5 seconds through 1 minute (default 30 seconds); shorter settings were not timed.
 
 As of 2026-10-02, the native outbound includes package race tests, default and
 `with_quic` builds, frozen reliable-frame vectors, and local gateway interoperability
@@ -432,7 +503,7 @@ validation. Offline coded vectors do not establish live coded-substrate support.
 
 The Linux amd64 release candidate passed one isolated full-program SOCKS run on
 an ordinary Debian VPS: default and explicitly enabled companion-gateway feedback,
-each with TLS, QUIC, TCP two-lane and QUIC isolation configurations. Those checks used literal IPv4 destinations. All 16 HTTP
+each with TLS, QUIC, TCP two-lane and QUIC isolation configurations. Those historical companion checks used literal IPv4 destinations. All 16 HTTP
 flows completed request half-close, exact 65,536-byte responses and real socket
 EOF; 32 single-send UDP probes passed. This validates those application paths,
 not an internal FIN/ACK trace, throughput ranking, failure recovery or WAN behavior.
@@ -485,9 +556,66 @@ rewrite the earlier result.
 
 Cloud netlink/netns restrictions previously blocked full SOCKS startup there; the
 Debian result above supplies a separate permitted environment's evidence. TUN,
-actual system routing, other-platform full-service operation and cross-host weak
-networks remain unqualified. Project-wide checks also have external-network
+actual system routing, other-platform full-service operation and broader weak-network
+loads remain unqualified; the finite proxy-impaired native windows are described below. Project-wide checks also have external-network
 `tlsfragment` constraints and experimental `libbox`/`boxdd` linking limitations
 with Go 1.25.13. Fork workflow trigger filters produced no CI runs/checks/status
 for the recent feature commits; this is not a passing CI result. Package and local
 results do not establish all sing-box project tests or all protocol capabilities.
+
+## Native two-endpoint acceptance (2026-10-02)
+
+The complete Linux amd64 sing-box program ran as kr2 outbound and de native
+inbound. Ordinary and isolated DATA modes each passed a 900-second fault window;
+total remote case times were 950.402 and 951.982 seconds, including bootstrap,
+final EOF, 45-second quiescence and client exit. Controller resource/log checks
+follow separately. These are finite low-load checks, not production stability.
+
+Each window kept three long TCP flows (8,192-byte chunks, at most one chunk per
+second per flow), completed 23 short flows and 16 frontend reset cancellations,
+and verified 17 single-send UDP probes at 1,200/8,192 bytes. The proxy added
+5–25ms delay each direction and dropped every 47th forward / 53rd reverse QUIC
+packet. At 60 seconds it blackholed QUIC for 40 seconds; at 300 and 600 seconds
+it reset all four owned replacement TCP pairs. Each destination remained the
+same logical socket. Exact TCP digests, EOF, one destination accept, UDP single
+delivery and source-port retention passed. After quiescence both client and
+gateway had 9 FDs; owned UDP relay sockets were gone. FD/RSS bounds over this
+finite run do not prove absence of every leak.
+
+Current-source Linux race tests passed with `with_quic` (504 test/subtest PASS
+events, 40.635s) and without (446, 13.590s), with no DATA RACE report. The builds
+took 63.504/22.271s using Go 1.27.1 and existing GCC in owned temporary storage.
+Official companion and opt-in long/resource suites were skipped (8/3 SKIP events).
+These skips are not covered by the package race result. The complete-program
+native windows are separate non-race runtime coverage.
+
+The first long-window attempt failed at startup after 22.729s, before injected
+faults, with initial QUIC OPEN deadlines. Its cause remains unexplained; later
+clean starts did not reproduce it. A subsequent 367.510s run exposed fixture
+reset behavior: cross-thread socket close retained a blocked Linux recv until
+its 65s timeout. An instrumented negative control failed after 168.318s; waking
+only the read side before SO_LINGER-zero close preserved an immediate peer RST.
+An intermediate 239.756s UDP failure exposed another fixture-only idle timeout
+that consumed an unintended resume attempt. Idle reads now keep polling. App
+TCP 65s / UDP probe 12s and product recovery budgets were not increased. The
+corrected 240s control and both 900s windows passed; all failures are retained.
+
+Each accepted window logged 16 gateway ERROR-level abort/grace-reclamation
+entries and had 16 explicit cancellations. All have unique cancellation-time
+matches: ordinary entries follow the 40s grace; isolated entries mix immediate
+abort and grace. Normal-flow destination digests and EOF passed. Logs do not
+carry fixture logical tags, so this is timing/count correlation, not exact
+per-wire attribution. No unexplained normal-flow error was identified and no
+unexpected QUIC-listener termination was logged.
+
+Online FEC/coded DATAGRAM remains uncompleted and was not retried. Asymmetric TCP
+blackhole guarantees, high load, TUN/system routing and sustained production use
+are not qualified. Enrollment/renewal, proactive scoring/cooldown and reverse
+carrier migration are not implemented. The earlier 21.060/21.029s figures measure
+QUIC loss to four upstream TCP connects, not TLS/JOIN completion or application
+recovery latency. A 20s gateway idle setting was used in these native tests;
+supported values are 5s–1m, default 30s. TCP recovery is 40s and UDP 20s after
+recognition, each admission 5s, at most three lifetime attempts.
+
+For full local SOCKS client and native server configurations with credential
+placeholders, see [the two-endpoint examples](../../../examples/queqiao-native/README.md).

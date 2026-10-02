@@ -81,11 +81,16 @@ type quicRoleLanes struct {
 	b          *tcpBundle
 	restoring  bool
 	generation uint64
+	tcpMode    bool // Conn.mu; sticky whole-flow retirement of the QUIC roles
 }
 
 func newQUICRoleConn(control, data net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, joinControl joinLaneFunc) *Conn {
+	return newQUICRoleConnWithPolicy(control, data, session, flow, onClose, ctx, joinControl, nil)
+}
+func newQUICRoleConnWithPolicy(control, data net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, joinControl joinLaneFunc, beforeRecovery func(error) bool) *Conn {
 	c := newConnState(control, session, flow, onClose)
 	c.join = joinControl
+	c.beforeRecovery = beforeRecovery
 	c.recoveryCtx, c.recoveryCancel = context.WithCancel(ctx)
 	b := &tcpBundle{c: c}
 	b.roles = &quicRoleLanes{b: b}
@@ -152,7 +157,7 @@ func (r *quicRoleLanes) shutdown(err error, queuedAbort *tcpBundleLane) {
 func (r *quicRoleLanes) restoreControl() {
 	c, b := r.b.c, r.b
 	c.mu.Lock()
-	if c.closed || b.lanes[0] != nil || b.lanes[1] == nil || r.restoring || c.recoveryAttempts >= maxRecoveryAttempts {
+	if c.closed || r.tcpMode || b.lanes[0] != nil || b.lanes[1] == nil || r.restoring || c.recoveryAttempts >= maxRecoveryAttempts {
 		c.mu.Unlock()
 		return
 	}
@@ -177,7 +182,7 @@ func (r *quicRoleLanes) restoreLoop(generation uint64) {
 	var lastErr error
 	for {
 		c.mu.Lock()
-		if c.closed || b.lanes[0] != nil || c.recoveryAttempts >= maxRecoveryAttempts {
+		if c.closed || r.tcpMode || b.lanes[0] != nil || c.recoveryAttempts >= maxRecoveryAttempts {
 			c.mu.Unlock()
 			return
 		}
@@ -197,6 +202,13 @@ func (r *quicRoleLanes) restoreLoop(generation uint64) {
 			}
 		}
 		raw, err := joinInitialBundleLane(ctx, c.join, c.session, c.flow)
+		c.mu.Lock()
+		stale := c.closed || r.tcpMode || r.generation != generation
+		c.mu.Unlock()
+		if stale {
+			abortCarrier(raw)
+			return
+		}
 		err = normalizeRoleAdmissionError(err)
 		if err != nil {
 			if !isolationMayDegrade(err) {
@@ -210,7 +222,7 @@ func (r *quicRoleLanes) restoreLoop(generation uint64) {
 			continue
 		}
 		c.mu.Lock()
-		if c.closed || ctx.Err() != nil || b.lanes[0] != nil || r.generation != generation {
+		if c.closed || r.tcpMode || ctx.Err() != nil || b.lanes[0] != nil || r.generation != generation {
 			c.mu.Unlock()
 			abortCarrier(raw)
 			return

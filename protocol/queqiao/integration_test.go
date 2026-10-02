@@ -327,6 +327,8 @@ func testOfficialGateway(t *testing.T, transport string) {
 	t.Run("TCP-JOIN-ACK-loss", func(t *testing.T) { testOfficialRecoveryACKLoss(t, profile, transport) })
 	t.Run("TCP-half-closed-recovery", func(t *testing.T) { testOfficialHalfClosedRecovery(t, profile, transport) })
 	if transport == "quic" {
+		t.Run("active-TCP-carrier-handoff", func(t *testing.T) { testOfficialTCPRecoveryWithHandoff(t, profile, transport, true) })
+		t.Run("active-UDP-carrier-handoff", func(t *testing.T) { testOfficialUDPActiveFallback(t, profile) })
 		t.Run("shared-connection-TCP-recovery", func(t *testing.T) { testOfficialSharedTCPRecovery(t, profile) })
 		t.Run("shared-connection-UDP-resume", func(t *testing.T) { testOfficialSharedUDPResume(t, profile) })
 	}

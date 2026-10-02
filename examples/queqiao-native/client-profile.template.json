@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "my-provider",
+  "provider_id": "<PROVIDER_ID_32_LOWER_HEX>",
+  "endpoint": "<SERVER_IP>:8443",
+  "gateway_id": "<GATEWAY_ID_32_LOWER_HEX>",
+  "root_pin": "<ROOT_CERT_SHA256_RAW_URL_BASE64>",
+  "root_certificate_pem": "<PROVIDER_ROOT_CERTIFICATE_PEM>",
+  "account_id": "<ACCOUNT_ID_32_LOWER_HEX>",
+  "device_id": "<DEVICE_ID_32_LOWER_HEX>",
+  "device_name": "my-device",
+  "device_certificate_pem": "<DEVICE_CERTIFICATE_CHAIN_PEM>",
+  "device_private_key_pem": "<DEVICE_PRIVATE_KEY_PEM>",
+  "created_at": "<CREATED_AT_RFC3339>"
+}

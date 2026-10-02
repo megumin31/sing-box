@@ -33,6 +33,38 @@ func initialQUICTerminalFailure(err error) bool {
 		errors.As(err, &version) || errors.As(err, &reset) || errors.As(err, &stream)
 }
 
+func activeQUICTerminalFailure(err error) bool {
+	return visitErrorTree(err, func(err error) bool {
+		switch e := err.(type) {
+		case *quic.TransportError:
+			return e.ErrorCode != 0
+		case *quic.ApplicationError:
+			return e.ErrorCode != 0
+		case *quic.StreamError:
+			return e.ErrorCode != 0
+		case *quic.VersionNegotiationError:
+			return true
+		}
+		return false
+	})
+}
+
+func activeQUICCarrierLoss(err error) bool {
+	return visitErrorTree(err, func(err error) bool {
+		switch e := err.(type) {
+		case *quic.StatelessResetError:
+			return true
+		case *quic.TransportError:
+			return e.ErrorCode == 0
+		case *quic.ApplicationError:
+			return e.ErrorCode == 0
+		case *quic.StreamError:
+			return e.ErrorCode == 0
+		}
+		return false
+	})
+}
+
 // Pool identity is the immutable authenticated profile, endpoint and common
 // dialer of this outbound. No cross-outbound or cross-principal sharing occurs.
 type quicPool struct {

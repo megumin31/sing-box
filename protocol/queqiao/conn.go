@@ -34,6 +34,7 @@ type Conn struct {
 	bundle                                    *tcpBundle
 	localAddr, remoteAddr                     net.Addr
 	join                                      joinLaneFunc
+	beforeRecovery                            func(error) bool
 	recoveryCtx                               context.Context
 	recoveryCancel                            context.CancelFunc
 	recovering, recoveryRunning               bool
@@ -76,8 +77,12 @@ func newConn(raw net.Conn, session [16]byte, flow uint64, onClose func()) *Conn 
 	return newRecoverableConn(raw, session, flow, onClose, nil, nil)
 }
 func newRecoverableConn(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, join joinLaneFunc) *Conn {
+	return newRecoverableConnWithPolicy(raw, session, flow, onClose, ctx, join, nil)
+}
+func newRecoverableConnWithPolicy(raw net.Conn, session [16]byte, flow uint64, onClose func(), ctx context.Context, join joinLaneFunc, beforeRecovery func(error) bool) *Conn {
 	c := newConnState(raw, session, flow, onClose)
 	c.join = join
+	c.beforeRecovery = beforeRecovery
 	if join != nil {
 		c.recoveryCtx, c.recoveryCancel = context.WithCancel(ctx)
 	}

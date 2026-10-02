@@ -52,6 +52,9 @@ func (o *Outbound) exchangeRecoveryOpenOnTransport(ctx context.Context, destinat
 }
 
 func (o *Outbound) exchangeRecoveryOpenWithRole(ctx context.Context, destination M.Socksaddr, generation uint64, request frame, useTCP, exclusive bool) (result net.Conn, response frame, resultErr error) {
+	if err := ctx.Err(); err != nil {
+		return nil, frame{}, err
+	}
 	// The loaded profile is immutable. Reject a device/issuer/root that has
 	// expired since construction before opening another authenticated socket.
 	if err := validateRecoveryIdentity(o.tlsConfig, time.Now()); err != nil {
@@ -61,6 +64,11 @@ func (o *Outbound) exchangeRecoveryOpenWithRole(ctx context.Context, destination
 	defer cancel()
 	defer func() {
 		if resultErr != nil && ctx.Err() != nil {
+			// An active handoff must preserve a parsed identity, permission or
+			// protocol refusal even if cancellation races with its response.
+			if o.activeFallback && carrierHandoffDenied(resultErr) {
+				return
+			}
 			// A role JOIN can leave a surviving flow active on transient failure.
 			// Never turn a parsed refusal into an allowed deadline degradation.
 			role := exclusive || request.flags&flagReserve != 0

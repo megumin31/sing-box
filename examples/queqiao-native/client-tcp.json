@@ -1,0 +1,26 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "local-socks",
+      "listen": "127.0.0.1",
+      "listen_port": 1080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "queqiao",
+      "tag": "gateway",
+      "profile_path": "./client-profile.json",
+      "transport": "tcp",
+      "tcp_recovery": true,
+      "udp_resume": true
+    }
+  ],
+  "route": {
+    "final": "gateway"
+  }
+}

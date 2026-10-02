@@ -278,6 +278,25 @@ func TestInitialFallbackRecoveryRetainsTransport(t *testing.T) {
 	}
 }
 
+func TestRecoveryCanceledContextDoesNotDial(t *testing.T) {
+	for _, tcp := range []bool{false, true} {
+		o := fallbackTestOutbound()
+		o.pool = fallbackPoolFunc(func(context.Context) (net.Conn, error) {
+			t.Fatal("canceled recovery opened QUIC")
+			return nil, nil
+		})
+		o.dialer = testDialer{dial: func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+			t.Fatal("canceled recovery opened TCP")
+			return nil, nil
+		}}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if raw, err := o.dialFixedCarrier(ctx, tcp); raw != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled recovery result: %v", err)
+		}
+	}
+}
+
 func TestInitialFallbackBothErrors(t *testing.T) {
 	o := fallbackTestOutbound()
 	quicErr, tcpErr := syscall.ECONNREFUSED, syscall.EHOSTUNREACH

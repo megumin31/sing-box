@@ -222,6 +222,40 @@ func (b *tcpBundle) failLane(lane *tcpBundleLane, err error) {
 		c.terminate(io.EOF)
 		return
 	}
+	if c.beforeRecovery != nil {
+		if !c.beforeRecovery(err) {
+			c.mu.Unlock()
+			c.terminate(err)
+			return
+		}
+		if b.roles != nil && !b.roles.tcpMode {
+			// Ordinary TCP JOIN replaces the entire reserved-control QUIC
+			// flow. Remove every schedulable QUIC lane under the same lock,
+			// then abort all their writers before starting that JOIN. A
+			// surviving DATA lane must not send concurrently with TLS DATA.
+			retired := b.lanes
+			b.lanes = [2]*tcpBundleLane{}
+			b.roles.tcpMode = true
+			b.roles.generation++
+			b.roles.restoring = false
+			c.carrier = nil
+			b.epoch++
+			c.recovering = true
+			start := !c.recoveryRunning
+			c.recoveryRunning = true
+			c.notifyLocked()
+			c.mu.Unlock()
+			for _, old := range retired {
+				if old != nil {
+					abortCarrier(old.raw)
+				}
+			}
+			if start {
+				go b.recover()
+			}
+			return
+		}
+	}
 	for i, current := range b.lanes {
 		if current == lane {
 			b.lanes[i] = nil
@@ -284,6 +318,11 @@ func (b *tcpBundle) readLoop(lane *tcpBundleLane) {
 }
 
 func (b *tcpBundle) recover() { b.recoverWithin(b.c.recoveryCtx) }
+func (b *tcpBundle) quicRolesActive() bool {
+	b.c.mu.Lock()
+	defer b.c.mu.Unlock()
+	return b.roles != nil && !b.roles.tcpMode
+}
 func (b *tcpBundle) recoverWithin(parent context.Context) {
 	c := b.c
 	ctx, cancel := context.WithTimeout(parent, recoveryTimeout)
@@ -329,12 +368,12 @@ func (b *tcpBundle) recoverWithin(parent context.Context) {
 				}
 			}
 			raw, err := joinInitialBundleLane(ctx, c.join, c.session, c.flow)
-			if b.roles != nil {
+			if b.quicRolesActive() {
 				err = normalizeRoleAdmissionError(err)
 			}
 			if err != nil {
 				lastErr = err
-				if permanentRecoveryError(err) || b.roles != nil && !isolationMayDegrade(err) {
+				if permanentRecoveryError(err) || b.quicRolesActive() && !isolationMayDegrade(err) {
 					c.terminate(err)
 					return
 				}
