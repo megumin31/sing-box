@@ -163,7 +163,17 @@ three-attempt/40-second recovery budget; transient exhaustion may leave a surviv
 data-only lane, but cannot hide authorization/protocol refusal. Late JOIN results
 cannot revive a closed flow. A JOIN transport EOF is an admission failure, not
 an application FIN. Normal completion drains both final-frame streams within
-the existing bounds before releasing their resources; cancellation aborts promptly.
+the existing bounds before releasing their resources.
+
+Explicit local close cancels application I/O and recovery immediately. If an idle
+lane accepts the complete authenticated ABORT within the 100 ms write budget,
+that stream receives its existing bounded drain (up to two seconds) before its
+quota is released; the other lane aborts immediately. This avoids resetting and
+discarding the just-queued ABORT. Busy or failed writes, protocol failures and
+other error terminations still abort immediately. Remote destination release is
+best-effort: a failed drain or already-broken carrier can still leave the gateway
+holding the flow until its recovery grace expires. Local close remains an error
+termination, not successful FIN completion.
 
 `quic_initial_fallback` still acts only before OPEN. If it selects authenticated
 TLS/TCP, this flow uses the ordinary single TLS lane with no reserved QUIC role.

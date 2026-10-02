@@ -99,11 +99,14 @@ func (b *tcpBundle) close() error {
 	}
 	offset := c.sendNext
 	c.mu.Unlock()
+	var queuedAbort *tcpBundleLane
 	if lane != nil {
 		lane.raw.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		_ = writeFrame(lane.raw, frame{typ: typeClose, flags: flagFIN | flagAbort, session: c.session, flow: c.flow, sequence: offset})
+		if err := writeFrame(lane.raw, frame{typ: typeClose, flags: flagFIN | flagAbort, session: c.session, flow: c.flow, sequence: offset}); err == nil {
+			queuedAbort = lane
+		}
 	}
-	c.terminate(net.ErrClosed)
+	c.terminateWithQueuedAbort(net.ErrClosed, queuedAbort)
 	return nil
 }
 

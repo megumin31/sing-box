@@ -102,6 +102,13 @@ func closeCarrier(conn net.Conn) {
 
 func (c *Conn) notifyLocked() { close(c.changed); c.changed = make(chan struct{}) }
 func (c *Conn) terminate(err error) {
+	c.terminateWithQueuedAbort(err, nil)
+}
+
+// A successful local Close may have queued its authenticated ABORT on one
+// QUIC role stream. Preserve only that specific stream's bounded drain; errors
+// and remote termination never obtain this exception to immediate abort.
+func (c *Conn) terminateWithQueuedAbort(err error, queuedAbort *tcpBundleLane) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -124,7 +131,7 @@ func (c *Conn) terminate(err error) {
 	// FIN/ACK_FINAL supplies the authenticated completion signal, so terminate
 	// the underlying carrier directly and promptly unblock both I/O workers.
 	if c.bundle != nil && c.bundle.roles != nil {
-		c.bundle.roles.shutdown(err)
+		c.bundle.roles.shutdown(err, queuedAbort)
 	} else {
 		closeCarrier(raw)
 		if c.bundle != nil {

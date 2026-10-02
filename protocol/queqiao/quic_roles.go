@@ -123,28 +123,28 @@ func (r *quicRoleLanes) selectLaneLocked(data bool) *tcpBundleLane {
 	}
 	return nil
 }
-func (r *quicRoleLanes) shutdown(err error) {
+func (r *quicRoleLanes) shutdown(err error, queuedAbort *tcpBundleLane) {
 	c, b := r.b.c, r.b
 	c.mu.Lock()
 	lanes := b.lanes
 	b.lanes = [2]*tcpBundleLane{}
 	c.mu.Unlock()
-	if err != io.EOF {
-		for _, lane := range lanes {
-			if lane != nil {
-				abortCarrier(lane.raw)
-			}
-		}
-		return
-	}
-	// Both streams may have carried final state during a role outage. Each
-	// quicCarrier.Close drains its own stream; parallel waits stay bounded by
-	// the existing two-second per-stream limit before releasing socket quota.
+	// Normal FIN completion can have final state on either stream. Explicit
+	// local Close instead drains only the still-owned stream that accepted its
+	// complete ABORT. Resetting it immediately would discard the queued abort
+	// and leave the gateway destination retained for the recovery grace.
+	// Each quicCarrier.Close is bounded by its existing two-second drain. Other
+	// streams and all failure paths abort immediately; quota is held until exit.
 	var wg sync.WaitGroup
 	for _, lane := range lanes {
-		if lane != nil {
+		if lane == nil {
+			continue
+		}
+		if err == io.EOF || err == net.ErrClosed && lane == queuedAbort {
 			wg.Add(1)
 			go func(raw net.Conn) { defer wg.Done(); closeCarrier(raw) }(lane.raw)
+		} else {
+			abortCarrier(lane.raw)
 		}
 	}
 	wg.Wait()
