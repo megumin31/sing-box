@@ -1,6 +1,9 @@
 # Queqiao
 
-Experimental native Queqiao protocol-1 outbound for TCP and UDP proxying.
+Native Queqiao protocol-1 outbound for TCP and UDP over reliable TLS/TCP or QUIC
+streams. Basic reliable-mode implementation and the bounded Linux functional
+qualification below are complete. This remains a preview release: it does not
+claim every optional Queqiao feature or production WAN qualification.
 
 ```json
 {
@@ -17,6 +20,63 @@ Experimental native Queqiao protocol-1 outbound for TCP and UDP proxying.
   "network": ["tcp", "udp"]
 }
 ```
+
+## Practical configurations
+
+For an already enrolled official version-1 profile, the smallest reliable TLS/TCP
+outbound is:
+
+```json
+{
+  "type": "queqiao",
+  "tag": "queqiao-out",
+  "profile_path": "/etc/sing-box/queqiao-profile.json",
+  "transport": "tcp"
+}
+```
+
+This carries both application TCP and UDP through authenticated TLS. Add it to
+sing-box's `outbounds` and select its tag through the usual route rules or
+`route.final`. It does not run an official client subprocess. Provision the
+profile separately; do not put invitations or private-key material into logs.
+
+For a `with_quic` build and a gateway offering both carriers on the profile's
+endpoint, use `"transport": "quic"`. Optionally add
+`"quic_initial_fallback": true` for the bounded pre-OPEN fallback below. Application
+TCP and UDP still use reliable streams; DATAGRAM is not advertised.
+
+The smallest configurations do not enable recovery or extra lanes. Enable
+`tcp_recovery` or `udp_resume` only when their bounded semantics match the
+application. The separately delivered companion gateway fixes TCP finalization
+and UDP relay handover defects in the pinned upstream version. These are gateway
+changes, not hidden native-client behavior. In particular, the corrected UDP
+handover must not be assumed when connecting to an unpatched gateway.
+
+Protocol-1 explicitly permits QUIC without DATAGRAM (protocol §11). Reliable
+TCP/UDP support does not imply live FEC, active-flow cross-carrier migration, or
+performance equivalent to every official-client policy.
+
+A minimal full-program SOCKS configuration using the TLS/TCP carrier is:
+
+```json
+{
+  "inbounds": [
+    {"type": "socks", "tag": "local-socks", "listen": "127.0.0.1", "listen_port": 1080}
+  ],
+  "outbounds": [
+    {"type": "queqiao", "tag": "queqiao-out", "profile_path": "/etc/sing-box/queqiao-profile.json", "transport": "tcp"}
+  ],
+  "route": {"final": "queqiao-out"}
+}
+```
+
+Choose an available local port, validate with `sing-box check -c config.json`, then
+run with `sing-box run -c config.json`. A profile endpoint containing a domain
+also needs the normal [domain resolver configuration](../shared/dial.md#domain_resolver).
+The application may send domain, IPv4 or IPv6 destinations to this SOCKS inbound;
+the gateway resolves application domains. QUIC uses the same configuration with
+`"transport": "quic"` and a `with_quic` build. These examples enable no optional
+recovery, fallback, probe or extra-lane policy.
 
 ## Fields
 
@@ -88,10 +148,15 @@ of one waiter, authenticated TCP fallback for the others, automatic TCP JOIN
 without reopening the destination, and UDP resume preserving the source endpoint
 observed by a real UDP target. However, strict single-send probes reproducibly
 lost the first reply immediately after UDP resume, although the target received
-and replied to that datagram; later probes succeeded. This remains an unresolved
-handover issue, so official UDP fallback/resume acceptance is incomplete. It does
-not establish lossless or exactly-once UDP delivery. Full service operation,
-wider recovery stress and WAN qualification remain unverified.
+and replied to that datagram; later probes succeeded. A separate diagnostic
+attributed a lost reply in its instrumented run to the old gateway relay reader
+surviving socket handover. The companion gateway patch stops and joins that reader
+before publishing the retained socket. Strict single-send probes and source-endpoint
+retention passed against that patched gateway. The original pinned gateway's
+failure is retained as evidence; these two gateway variants must not be described
+as having identical acceptance results. Even the patched variant does not provide
+lossless or exactly-once UDP delivery. Linux full-SOCKS checks and bounded local
+recovery/resource checks are described below; WAN qualification remains open.
 
 ### quic_path_probe
 
@@ -348,27 +413,81 @@ normal recovery metadata until its own timeout.
 This version includes an offline FEC codec and fragment reassembly module verified
 with conformance vectors, budget tests and fuzzing. It is not connected to the
 network send/receive paths. The outbound does not negotiate DATAGRAM; the offline
-module does not provide live FEC/coded DATAGRAM support. Active-flow transport migration, extra
-lanes, enrollment and automatic renewal remain unimplemented. No claim is made to
+module does not provide live FEC/coded DATAGRAM support. Active-flow cross-carrier
+migration, automatic data-lane refill, enrollment and automatic renewal remain
+unimplemented. The explicit two-TCP-lane and QUIC control/data options above are
+implemented; they do not provide arbitrary lane scheduling. No claim is made to
 reproduce Queqiao's full protocol surface or WAN performance optimizations.
 
 ## Verification status and known limitations
 
-As of 2026-09-30, the independently reviewed fixes checkpoint passed Queqiao
-package race tests with default and `with_quic` builds, official-gateway loopback
-interoperability using temporary local identities, and CLI builds in both
-configurations. These results do not establish that all sing-box project tests
-pass, production readiness, or WAN performance.
+As of 2026-10-02, the native outbound includes package race tests, default and
+`with_quic` builds, frozen reliable-frame vectors, and local gateway interoperability
+using temporary identities. Applicable reliable vector groups cover frame headers,
+ACK ranges, canonical destinations, RESET payloads and UDP forms. Destination
+vectors also contain raw CLI whitespace normalization examples: this outbound's
+structured destinations and strict profile fields do not expose that CLI parser;
+those cases verify the canonical wire spelling while retaining strict field
+validation. Offline coded vectors do not establish live coded-substrate support.
 
-One earlier TCP large full-duplex and half-close interoperability test returned
-`unexpected EOF`; that failure remains unresolved. A separate controlled test
-reproduced an official-gateway race that can close a lane before physically sending
-FIN, but it has not established the cause of that historical EOF. Later passing
-tests do not remove this open risk, and enabling recovery must not be treated as
-a fix for it.
+The Linux amd64 release candidate passed one isolated full-program SOCKS run on
+an ordinary Debian VPS: default and explicitly enabled companion-gateway feedback,
+each with TLS, QUIC, TCP two-lane and QUIC isolation configurations. Those checks used literal IPv4 destinations. All 16 HTTP
+flows completed request half-close, exact 65,536-byte responses and real socket
+EOF; 32 single-send UDP probes passed. This validates those application paths,
+not an internal FIN/ACK trace, throughput ranking, failure recovery or WAN behavior.
+The original service and its ports were not changed.
 
-The current test environment's netlink/netns permission restrictions blocked full
-SOCKS service validation. TUN and actual system routing have not been qualified.
-Project-wide checks also have external-network `tlsfragment` test constraints and
-experimental `libbox`/`boxdd` linking limitations with Go 1.25.13. The package-level
-results above do not replace those checks.
+A subsequent full-SOCKS domain/dialer qualification exposed a native integration
+bug: the generic packet adapter converted a structured domain destination into
+`net.UDPAddr`, dropping its hostname before the Queqiao writer received it.
+The original failure was retained. A separate run with that same old binary
+established that the HTTP body and real EOF passed, then the first zero-payload
+domain UDP probe timed out with no target receipt. This outbound now implements
+sing-box's structured packet interface directly, preserving the domain and the
+established buffer-ownership contract. Deterministic before/after adapter tests,
+buffer-ownership/deadline race regressions, and companion-gateway TLS and QUIC
+adapter tests passed without changing application retries or timeouts.
+
+The fixed Linux amd64 binary then passed the identical first-case diagnostic and
+one non-overlapping continuation on the Debian VPS. Together these verified all
+four combinations of TLS/TCP or QUIC with either a dedicated local gateway-DNS
+resolver or an owned SOCKS detour. Each combination used both an application
+domain (`localhost`) and an IPv6 literal (`::1`): eight HTTP flows returned exact
+65,536-byte bodies and real EOF, and 16 single-send UDP probes (0/1,200 bytes)
+matched exact target receipt counts. DNS query observations verified common-dialer
+endpoint resolution; hop logs verified TCP/UDP carrier traversal. After stopping
+each detour, a fresh primary returned SOCKS failure code 5 with the exact hop's
+connection-refused error, proving failure rather than direct bypass. The two
+reports are linked by the first report's SHA256 and pin identical binary hashes.
+All owned processes, temporary identities and listeners were cleaned. This is
+loopback qualification of those paths, not arbitrary DNS, interface, platform or
+network-environment coverage.
+
+A separate race-enabled loopback resource test ran once per gateway feedback
+setting. Each group kept four logical TCP flows for 96 seconds, closed 24 short
+flows, and interrupted the isolated QUIC pool three times. Each isolated logical
+flow completed exactly three lifetime JOINs without recreating its destination.
+After the last all-lane failure it continued on the restored control lane; no data
+lane was refilled. Each group verified 51,904,512 bidirectional payload bytes,
+then observed the real 30-second shared-pool idle expiry before outbound close.
+Owned active/slot/pool/socket counts reached zero; terminal goroutine and native/
+gateway FD counts matched the later stable warm samples (5/9/7). Coarse snapshots,
+a small runtime allowance and a finite run do not prove absence of every leak or
+long-term production stability. These tests use the companion gateway candidate.
+
+One historical TCP large full-duplex and half-close test returned `unexpected EOF`.
+A separate controlled test proved an upstream FIN lifecycle race. The companion
+gateway fixes that proven mechanism and passed its targeted finalization/replay
+regressions, but no same-run evidence establishes that it caused the historical
+failure. Keep that causal uncertainty; neither later passes nor enabled recovery
+rewrite the earlier result.
+
+Cloud netlink/netns restrictions previously blocked full SOCKS startup there; the
+Debian result above supplies a separate permitted environment's evidence. TUN,
+actual system routing, other-platform full-service operation and cross-host weak
+networks remain unqualified. Project-wide checks also have external-network
+`tlsfragment` constraints and experimental `libbox`/`boxdd` linking limitations
+with Go 1.25.13. Fork workflow trigger filters produced no CI runs/checks/status
+for the recent feature commits; this is not a passing CI result. Package and local
+results do not establish all sing-box project tests or all protocol capabilities.

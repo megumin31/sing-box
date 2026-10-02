@@ -321,6 +321,7 @@ type stabilityTarget struct {
 	held             chan stabilityHeld
 	timeoutHeld      chan stabilityHeld
 	errors           chan error
+	holdPlan         map[uint64]bool // Optional test-only synchronized reply holds.
 }
 
 func newStabilityTarget(t *testing.T, ctx context.Context) *stabilityTarget {
@@ -410,7 +411,10 @@ func (s *stabilityTarget) serve(ctx context.Context, c net.Conn) error {
 		s.activeIDs[id] = true
 		s.mu.Unlock()
 		ownedID, hasID = id, true
-		if id == 0 && seq == 12 || id == 2 && (seq == 28 || seq == 36) {
+		s.mu.Lock()
+		plannedHold := s.holdPlan[uint64(id)<<32|uint64(seq)]
+		s.mu.Unlock()
+		if plannedHold || id == 0 && seq == 12 || id == 2 && (seq == 28 || seq == 36) {
 			e := stabilityHeld{id, seq, make(chan struct{})}
 			select {
 			case s.held <- e:
@@ -451,7 +455,7 @@ func (s *stabilityTarget) serve(ctx context.Context, c net.Conn) error {
 	}
 }
 
-func stabilityGateway(t *testing.T, ctx context.Context, bin string, feedback bool) string {
+func stabilityGateway(t *testing.T, ctx context.Context, bin string, feedback bool, observe ...func(int)) string {
 	t.Helper()
 	dir := t.TempDir()
 	state, profile := filepath.Join(dir, "provider"), filepath.Join(dir, "profile.json")
@@ -488,6 +492,9 @@ func stabilityGateway(t *testing.T, ctx context.Context, bin string, feedback bo
 	if err = gateway.Start(); err != nil {
 		log.Close()
 		t.Fatal(err)
+	}
+	for _, callback := range observe {
+		callback(gateway.Process.Pid)
 	}
 	t.Cleanup(func() {
 		gateway.Process.Kill()

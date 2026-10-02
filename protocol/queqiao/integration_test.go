@@ -299,6 +299,7 @@ func testOfficialGateway(t *testing.T, transport string) {
 			t.Fatal("packet association accepted")
 		}
 	})
+	t.Run("UDP-sing-box-packet-adapter", func(t *testing.T) { testPacketAdapterGateway(t, o) })
 	testOfficialUDP(t, o)
 	t.Run("UDP-resume-enabled-basic", func(t *testing.T) { testOfficialUDP(t, resumeTestOutbound(t, profile, transport)) })
 	t.Run("UDP-resume", func(t *testing.T) { testOfficialUDPResume(t, profile, transport) })

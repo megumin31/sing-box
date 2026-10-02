@@ -10,6 +10,10 @@ import (
 	"net/netip"
 	"os"
 	"time"
+
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 const (
@@ -102,6 +106,24 @@ type packetConn struct {
 }
 
 var _ net.PacketConn = (*packetConn)(nil)
+var _ N.NetPacketConn = (*packetConn)(nil)
+
+// Keep structured destinations intact through sing-box's packet-copy path.
+// A net.UDPAddr cannot represent a domain; the generic net.PacketConn adapter
+// would discard its Fqdn before WriteTo could encode the gateway destination.
+func (p *packetConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
+	_, err := p.WriteTo(buffer.Bytes(), destination)
+	return err
+}
+
+func (p *packetConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	_, source, err := buffer.ReadPacketFrom(p)
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.SocksaddrFromNet(source).Unwrap(), nil
+}
 
 func newPacketConn(raw net.Conn, session [16]byte, flow uint64, onClose func()) *packetConn {
 	return newResumablePacketConn(raw, session, flow, onClose, nil, [16]byte{}, nil)
